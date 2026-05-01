@@ -1,3 +1,8 @@
+console.log("start server");
+
+
+console.log("ADMIN_UID:", process.env.ADMIN_UID);
+console.log('FIREBASE RAW:", process.env.FIREBASE_SERVICE_ACCOUNT?.slice(0, 50));
 const express = require("express");
  const admin = require("firebase-admin");
  const cors = require("cors");

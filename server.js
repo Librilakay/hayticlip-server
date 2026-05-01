@@ -1,8 +1,12 @@
-console.log("start server");
+require("dotenv").config();
 
-
+console.log("START SERVER");
 console.log("ADMIN_UID:", process.env.ADMIN_UID);
-console.log('FIREBASE RAW:", process.env.FIREBASE_SERVICE_ACCOUNT?.slice(0, 50));
+console.log("FIREBASE RAW:", process.env.FIREBASE_SERVICE_ACCOUNT ? process.env.FIREBASE_SERVICE_ACCOUNT.slice(0, 50) : "MISSING");
+
+
+
+
 const express = require("express");
  const admin = require("firebase-admin");
  const cors = require("cors");
@@ -14,7 +18,6 @@ const express = require("express");
 const fs = require("fs");
  const ffmpeg = require("fluent-ffmpeg");
 
-require("dotenv").config();
 
 const app = express();
 
@@ -68,9 +71,16 @@ const upload = multer({
 });
 
 // FIREBASE ADMIN
+let serviceAccount;
 
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  console.log("Firebase JSON OK");
+} catch (e) {
+  console.error("Firebase JSON ERROR:", e.message);
+  process.exit(1);
+}
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
 credential: admin.credential.cert(serviceAccount),

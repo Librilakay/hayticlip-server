@@ -35,11 +35,27 @@ app.use(bodyParser.json({ limit: "1mb" }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
 
+
+const allowedOrigins = [
+  "https://hayticlips.com",
+  "https://www.hayticlips.com",
+  "https://hayticlips-frontend.vercel.app"
+];
+
 app.use(cors({
-  origin:"*",
-  methods: ["GET","POST"],
-  allowedHeaders: ["Content-Type","Authorization"]
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // mobile apps / tests
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      return callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST"],
+  credentials: true
 }));
+
 
 const path = require("path");
 app.use(express.static(path.join(__dirname, "../hayticlips")));

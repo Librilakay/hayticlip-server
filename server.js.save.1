@@ -1,0 +1,959 @@
+const express = require("express");
+const admin = require("firebase-admin");
+const cors = require("cors");
+const rateLimit = require("express-rate-limit");
+const bodyParser = require('body-parser'); // ← AJOUTE CECI
+const bcrypt = require("bcryptjs");
+const axios = require("axios");
+
+const app = express();
+
+const apiLimiter = rateLimit({
+windowMs: 60 * 1000,
+max: 100
+});
+
+app.use("/api/", apiLimiter);
+
+
+
+//  SOLUTION : Utiliser bodyParser au lieu de express.json()
+app.use(bodyParser.json({ limit: "1mb" }));
+app.use(bodyParser.urlencoded({ extended: true }));
+
+
+app.use(cors({
+  origin:"*",
+  methods: ["GET","POST"],
+  allowedHeaders: ["Content-Type","Authorization"]
+}));
+
+const path = require("path");
+app.use(express.static(path.join(__dirname, "../hayticlips")));
+
+// Middleware de log
+
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.path}`);
+  next();
+});
+
+
+const giftLimiter = rateLimit({
+windowMs: 10 * 1000,
+max: 5
+});
+
+
+const compressLimiter = rateLimit({
+windowMs: 60 * 1000,
+max: 10
+});
+
+
+// FIREBASE ADMIN
+const serviceAccount = require("./serviceAccountKey.json");
+
+admin.initializeApp({
+credential: admin.credential.cert(serviceAccount),
+projectId: "tstx-58474",
+databaseURL: "https://tstx-58474.firebaseio.com"
+});
+
+const db = admin.firestore();
+db.settings({ ignoreUndefinedProperties: true });
+
+// ADMIN UID
+const ADMIN_UID = "fbKbdrMWPTfjoWOmJ6XwZC6Butn1";
+
+async function verifyFirebaseToken(req,res,next){
+
+try{
+
+const authHeader = req.headers.authorization || "";
+if(!authHeader.startsWith("Bearer ")){
+return res.status(401).json({error:"missing token"});
+}
+
+
+const token = authHeader.replace("Bearer ","").trim();
+const decoded = await admin.auth().verifyIdToken(token);
+
+req.user = decoded;
+
+next();
+
+}catch(e){
+
+console.log("TOKEN ERROR:", e);
+
+return res.status(401).json({error:"invalid token"});
+}
+
+}// CALCUL CADEAUX
+function calculateGift(amount){
+
+const allowed = [25,50,100,250,500,1000];
+
+if(!allowed.includes(amount)){
+return null;
+}
+
+if(amount === 25) return {creator:15, admin:10};
+if(amount === 50) return {creator:35, admin:15};
+if(amount === 100) return {creator:75, admin:25};
+if(amount === 250) return {creator:200, admin:50};
+if(amount === 500) return {creator:400, admin:100};
+if(amount === 1000) return {creator:800, admin:200};
+
+return null;
+}
+
+// ROUTE ENVOI CADEAU
+app.post("/api/sendGift", giftLimiter, verifyFirebaseToken, async (req,res)=>{
+
+try{
+
+const {videoId, amount} = req.body;
+
+const giftAmount = Number(amount);
+
+if(!Number.isInteger(giftAmount)){
+return res.status(400).json({error:"invalid amount"});
+}
+
+const fromUser = req.user.uid;
+
+
+if(!videoId || !giftAmount){
+return res.status(400).json({error:"missing data"});
+}
+
+const gift = calculateGift(giftAmount);
+
+if(!gift){
+return res.status(400).json({error:"invalid amount"});
+}
+
+// VIDEO
+const videoRef = db.collection("videos").doc(videoId);
+const videoSnap = await videoRef.get();
+
+if(!videoSnap.exists){
+return res.status(404).json({error:"video not found"});
+}
+
+const videoData = videoSnap.data();
+
+if(videoData.archived === true){
+return res.status(400).json({error:"video archived"});
+}
+
+const creatorId = videoData.userId;
+
+if(!creatorId){
+return res.status(400).json({error:"invalid creator"});
+}
+
+if(fromUser === creatorId){
+return res.status(400).json({error:"can not send gift to yourself"});
+}
+
+// USERS
+const senderRef = db.collection("users").doc(fromUser);
+const creatorRef = db.collection("users").doc(creatorId);
+const adminRef = db.collection("users").doc(ADMIN_UID);
+
+const senderSnap = await senderRef.get();
+const creatorSnap = await creatorRef.get();
+
+const senderDataTop = senderSnap.data() || {};
+
+if(senderDataTop.suspended === true){
+  return res.status(403).json({error:"account suspended"});
+}
+
+if(!senderSnap.exists){
+return res.status(404).json({error:"sender not found"});
+}
+
+
+if(!creatorSnap.exists){
+return res.status(404).json({error:"creator not found"});
+}
+
+
+// TRANSACTION
+await db.runTransaction(async t=>{
+
+const senderDoc = await t.get(senderRef);
+
+if(!senderDoc.exists){
+throw new Error("sender not found");
+}
+
+
+const senderData = senderDoc.data();
+const wallet = Number(senderData.wallet ?? 0);
+
+if(!senderData) throw new Error("sender data missing");
+
+
+if(wallet <= 0){
+throw new Error("wallet empty");
+}
+
+if(wallet < giftAmount){
+throw new Error("not enough balance");
+}
+
+const senderWallet = Number(senderData.wallet || 0);
+const newSenderBalance = senderWallet - giftAmount;
+
+const creatorDoc = await t.get(creatorRef);
+
+if(!creatorDoc.exists){
+throw new Error("creator not found");
+}
+
+
+const creatorData = creatorDoc.data() || {};
+const creatorWallet = Number(creatorData.wallet || 0);
+const newCreatorBalance = creatorWallet + gift.creator;
+
+const adminDoc = await t.get(adminRef);
+
+if(!adminDoc.exists){
+  throw new Error("admin not found");
+}
+
+const adminData = adminDoc.data() || {};
+const adminWallet = Number(adminData.wallet || 0);
+const newAdminBalance = adminWallet + gift.admin;
+
+let receiverBalanceAfter = newCreatorBalance;
+
+// update wallets
+t.update(senderRef,{ wallet: newSenderBalance });
+
+if (creatorId === ADMIN_UID) {
+  const total = gift.creator + gift.admin;
+  receiverBalanceAfter = adminWallet + total;
+
+  t.update(adminRef,{
+    wallet: receiverBalanceAfter
+  });
+} else {
+  t.update(creatorRef,{ wallet: newCreatorBalance });
+  t.update(adminRef,{ wallet: newAdminBalance });
+}
+
+
+// log transaction gift
+const giftRef = db.collection("giftTransactions").doc();
+
+t.set(giftRef,{
+from: fromUser,
+to: creatorId,
+videoId: videoId,
+amount: giftAmount,
+creatorEarn: gift.creator,
+adminEarn: gift.admin,
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+
+
+// transaction wallet sender
+const senderTx = db.collection("walletTransactions").doc();
+
+
+t.set(senderTx,{
+userId: fromUser,
+type: "gift_sent",
+amount: giftAmount,
+receiverId: creatorId,
+videoId: videoId,
+balanceAfter: newSenderBalance,
+status: "completed",
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+
+
+// transaction wallet receiver
+const receiverTx = db.collection("walletTransactions").doc();
+
+
+t.set(receiverTx,{
+userId: creatorId,
+type: "gift_received",
+amount: gift.creator,
+senderId: fromUser,
+videoId: videoId,
+balanceAfter: receiverBalanceAfter,
+status: "completed",
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+
+
+const notifRef = db.collection("notifications").doc();
+
+t.set(notifRef,{
+to: creatorId,
+from: fromUser,
+fromUsername: senderData.username || "Utilisateur",
+fromAvatar: senderData.avatar || null,
+type: "gift",
+videoId: videoId,
+amount: giftAmount,
+read: false,
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+});
+
+res.json({success:true});
+
+}catch(e){
+
+console.log("GIFT ERROR:", e);
+
+res.status(500).json({
+error: e.message
+});
+
+}
+
+});
+
+
+
+/* ================= WALLET WITHDRAW ================= */
+
+app.post("/api/requestWithdraw", verifyFirebaseToken, async (req,res)=>{
+try{
+
+
+const uid = req.user.uid;
+
+const {amount, pin} = req.body;
+
+const userRef = db.collection("users").doc(uid);
+const userSnap = await userRef.get();
+
+if(!userSnap.exists){
+return res.json({error:"User not found"});
+}
+
+const user = userSnap.data();
+
+if(user.suspended === true){
+  return res.status(403).json({error:"Compte suspendu"});
+}
+
+const isAdmin = uid === ADMIN_UID;
+
+const withdrawLimit = isAdmin ? 80000 : 20000;
+
+
+/* vérifier numero retrait */
+
+if(!user.withdrawNumber){
+return res.json({error:"Numero de retrait non enregistré"});
+}
+
+/* empêcher même numero pour plusieurs comptes */
+
+const numberCheck = await db.collection("users")
+.where("withdrawNumber","==",user.withdrawNumber)
+.get();
+
+if(!numberCheck.empty){
+
+for(const doc of numberCheck.docs){
+
+if(doc.id !== uid){
+
+return res.json({
+error:"Ce numero de retrait est deja utilisé par un autre compte"
+});
+
+}
+
+}
+
+}
+
+
+/* vérifier retrait en cours */
+
+const pending = await db.collection("walletTransactions")
+.where("userId","==",uid)
+.where("type","==","withdraw")
+.where("status","==","pending")
+.get();
+
+if(!pending.empty){
+return res.json({error:"Un retrait est déjà en cours"});
+}
+
+/* vérifier wallet */
+
+if(!Number.isInteger(amount) || amount <= 0){
+return res.json({error:"Montant invalide"});
+}
+
+
+const allowedWithdraw = [250,500,1000,2000,5000,10000,20000,80000];
+
+if(!allowedWithdraw.includes(amount)){
+return res.json({error:"Montant non autorisé"});
+}
+
+if(amount > user.wallet){
+return res.json({error:"Solde insuffisant"});
+}
+
+
+if(!user.security || !user.security.pinHash){
+return res.json({error:"PIN non configuré"});
+}
+
+
+/* vérifier pin */
+
+if(!/^\d{6}$/.test(pin || "")){
+  return res.json({error:"PIN invalide"});
+}
+
+const hash = user.security.pinHash;
+
+const valid = await bcrypt.compare(pin, hash);
+
+if(!valid){
+  return res.json({error:"PIN incorrect"});
+}
+
+/* transaction sécurisée retrait */
+
+let txId = null;
+
+await db.runTransaction(async (t)=>{
+
+const freshSnap = await t.get(userRef);
+const freshUser = freshSnap.data();
+
+if(amount > freshUser.wallet){
+throw new Error("Solde insuffisant");
+}
+
+
+
+const lastReset = freshUser.withdrawResetAt?.toMillis?.() || 0;
+const now = Date.now();
+
+let dailyTotal = freshUser.withdrawDailyTotal || 0;
+
+// reset si plus de 24h
+if(now - lastReset > 86400000){
+  dailyTotal = 0;
+}
+
+if(dailyTotal + amount > withdrawLimit){
+  throw new Error("Limite journalière atteinte (" + withdrawLimit + " Gdes / 24h)");
+}
+
+const txRef = db.collection("walletTransactions").doc();
+txId = txRef.id;
+
+
+
+const newBalance = freshUser.wallet - amount;
+
+t.set(txRef,{
+userId: uid,
+amount: amount,
+number: freshUser.withdrawNumber,
+method: "moncash",
+type: "withdraw",
+balanceAfter: newBalance,
+status: "pending",
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+
+
+t.update(userRef,{
+  wallet: newBalance,
+  withdrawDailyTotal: dailyTotal + amount,
+  withdrawResetAt: admin.firestore.FieldValue.serverTimestamp(),
+  lastWithdrawRequest: Date.now()
+});
+
+});
+
+
+/* espace API MonCash */
+
+console.log("MONCASH API READY");
+
+/* réponse */
+
+res.json({
+success:true,
+txId:txId
+});
+
+}catch(e){
+
+console.log("WITHDRAW ERROR:",e);
+res.status(500).json({error:e.message});
+
+}
+
+});
+
+
+/* ================= SAVE WITHDRAW NUMBER ================= */
+
+
+app.post("/api/saveWithdrawNumber", verifyFirebaseToken, async (req,res)=>{
+try{
+
+const uid = req.user.uid;
+
+
+let {number} = req.body;
+
+if(typeof number !== "string" || !number.trim()){
+  return res.status(400).json({error:"Numero invalide"});
+}
+
+/* nettoyer numero */
+let clean = number.replace(/\D/g,"");
+
+if(clean.length === 8){
+clean = "509" + clean;
+}
+
+/* verifier numero Digicel */
+
+const allowedPrefixes = [
+"31","34","36","37","38","39","44","46","47","49"
+];
+
+if(
+clean.length !== 11 ||
+!clean.startsWith("509") ||
+!allowedPrefixes.includes(clean.slice(3,5))
+){
+return res.json({error:"Numero invalide"});
+}
+
+/* 🔒 vérifier si numero deja utilisé */
+
+const existing = await db.collection("users")
+.where("withdrawNumber","==",clean)
+.get();
+
+if(!existing.empty){
+
+for(const doc of existing.docs){
+
+if(doc.id !== uid){
+
+return res.json({
+error:"Ce numero est deja utilisé par un autre compte"
+});
+
+}
+
+}
+
+}
+
+/* récupérer utilisateur */
+
+const userRef = db.collection("users").doc(uid);
+const userSnap = await userRef.get();
+
+if(!userSnap.exists){
+return res.json({error:"User not found"});
+}
+
+const user = userSnap.data();
+
+if(user.suspended === true){
+  return res.status(403).json({error:"Compte suspendu"});
+}
+
+
+/* verifier délai 150 jours */
+
+const last = user.withdrawNumberUpdatedAt?.toMillis?.() || 0;
+
+const days150 = 150 * 24 * 60 * 60 * 1000;
+
+if(last && Date.now() - last < days150){
+return res.json({error:"Modification possible tous les 150 jours"});
+}
+
+/* enregistrer numero */
+
+await userRef.update({
+
+withdrawNumber: clean,
+withdrawNumberUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+
+});
+
+res.json({success:true});
+
+}catch(e){
+
+console.log("SAVE NUMBER ERROR:",e);
+res.status(500).json({error:e.message});
+
+}
+
+});
+
+
+
+/* ================= WALLET RECHARGE ================= */
+
+app.post("/api/requestRecharge", verifyFirebaseToken, async (req,res)=>{
+
+try{
+
+const uid = req.user.uid;
+
+const amount = Number(req.body.amount);
+
+
+/* récupérer utilisateur */
+
+const userRef = db.collection("users").doc(uid);
+const userSnap = await userRef.get();
+
+if(!userSnap.exists){
+return res.json({error:"User not found"});
+}
+
+const user = userSnap.data();
+
+if(user.suspended === true){
+  return res.status(403).json({error:"Compte suspendu"});
+}
+
+
+/* montants autorisés */
+
+const allowed = [50,100,250,500,1000,5000,10000];
+
+if(!allowed.includes(amount)){
+return res.json({error:"Montant invalide"});
+}
+
+/* empêcher plusieurs recharges pending */
+
+const pending = await db.collection("walletTransactions")
+.where("userId","==",uid)
+.where("type","==","deposit")
+.where("status","==","pending")
+.get();
+
+if(!pending.empty){
+return res.json({error:"Une recharge est déjà en cours"});
+}
+
+/* créer transaction recharge */
+
+
+const txRef = db.collection("walletTransactions").doc();
+
+
+
+await txRef.set({
+userId: uid,
+amount: amount,
+type: "deposit",
+method: "moncash",
+status: "pending",
+createdAt: admin.firestore.FieldValue.serverTimestamp()
+});
+
+/* espace paiement MonCash */
+
+console.log("RECHARGE MONCASH READY");
+
+/* réponse */
+
+res.json({
+success:true,
+txId:txRef.id
+});
+
+}catch(e){
+
+console.log("RECHARGE ERROR:",e);
+res.status(500).json({error:e.message});
+
+}
+
+});
+
+
+
+
+app.post("/set-pin", verifyFirebaseToken, async (req,res)=>{
+  try{
+
+    const uid = req.user.uid;
+    const { pin } = req.body;
+
+
+if(!/^\d{6}$/.test(pin || "")){
+  return res.json({success:false});
+}
+
+const userSnap = await db.collection("users").doc(uid).get();
+
+if(!userSnap.exists){
+  return res.status(404).json({error:"User not found"});
+}
+
+const userData = userSnap.data() || {};
+
+if(userData.suspended === true){
+  return res.status(403).json({error:"Compte suspendu"});
+}
+
+    // 🔐 HASH bcrypt
+    const hash = await bcrypt.hash(pin, 10);
+
+    await db.collection("users").doc(uid).update({
+      "security.enabled": true,
+      "security.pinHash": hash,
+      "security.createdAt": admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({success:true});
+
+  }catch(e){
+    console.log("SET PIN ERROR:", e);
+    res.status(500).json({error:e.message});
+  }
+});
+
+
+
+app.post("/check-pin", verifyFirebaseToken, async (req,res)=>{
+  try{
+
+    const uid = req.user.uid;
+    const { pin } = req.body;
+ 
+if(!/^\d{6}$/.test(pin || "")){
+  return res.json({success:false});
+}
+     
+    const userSnap = await db.collection("users").doc(uid).get();
+
+    if(!userSnap.exists){
+      return res.json({success:false});
+    }
+
+    const user = userSnap.data();
+
+    const hash = user.security?.pinHash;
+
+    if(!hash){
+      return res.json({success:false});
+    }
+
+    // 🔐 comparaison bcrypt
+    const valid = await bcrypt.compare(pin, hash);
+
+    if(!valid){
+      return res.json({success:false});
+    }
+
+    // ✅ update dernière vérification
+    await db.collection("users").doc(uid).update({
+      "security.lastVerified": admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({success:true});
+
+  }catch(e){
+    console.log("CHECK PIN ERROR:", e);
+    res.status(500).json({success:false});
+  }
+});
+
+
+app.post("/remove-pin", verifyFirebaseToken, async (req,res)=>{
+  try{
+
+    const uid = req.user.uid;
+    const { pin } = req.body;
+
+if(!/^\d{6}$/.test(pin || "")){
+  return res.json({error:"PIN invalide"});
+}
+
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+
+    if(!userSnap.exists){
+      return res.json({error:"User not found"});
+    }
+
+    const user = userSnap.data();
+    const hash = user.security?.pinHash;
+
+    if(!hash){
+      return res.json({error:"Aucun PIN"});
+    }
+
+    const valid = await bcrypt.compare(pin, hash);
+
+    if(!valid){
+      return res.json({error:"PIN incorrect"});
+    }
+
+    await userRef.update({
+      "security.enabled": false,
+      "security.pinHash": null,
+      "security.lastVerified": admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({success:true});
+
+  }catch(e){
+    console.log("REMOVE PIN ERROR:", e);
+    res.status(500).json({error:e.message});
+  }
+});
+
+
+app.post("/api/initUserProfile", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { prenom, nom, phone } = req.body;
+
+    if (
+      typeof prenom !== "string" ||
+      typeof nom !== "string" ||
+      typeof phone !== "string"
+    ) {
+      return res.status(400).json({ error: "Données invalides" });
+    }
+
+    const cleanPrenom = prenom.trim().replace(/\s+/g, " ");
+    const cleanNom = nom.trim().replace(/\s+/g, " ");
+    const cleanPhone = phone.trim().replace(/\s+/g, "");
+
+    if (cleanPrenom.length < 2 || cleanPrenom.length > 30) {
+      return res.status(400).json({ error: "Prénom invalide" });
+    }
+
+    if (cleanNom.length < 2 || cleanNom.length > 30) {
+      return res.status(400).json({ error: "Nom invalide" });
+    }
+
+    if (!/^\+509\d{8}$/.test(cleanPhone)) {
+      return res.status(400).json({ error: "Numéro haïtien invalide" });
+    }
+
+    const userRecord = await admin.auth().getUser(uid);
+    const email = (userRecord.email || "").trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({ error: "Email introuvable" });
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+
+    if (userSnap.exists) {
+      return res.status(400).json({ error: "Profil déjà initialisé" });
+    }
+
+    const phoneCheck = await db.collection("users")
+      .where("phone", "==", cleanPhone)
+      .limit(1)
+      .get();
+
+    if (!phoneCheck.empty) {
+      return res.status(400).json({ error: "Ce numéro est déjà utilisé" });
+    }
+
+    const baseUsername = `${cleanPrenom}${cleanNom}`
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, "")
+      .replace(/[^a-z0-9_]/g, "")
+      .slice(0, 16);
+
+    let username = "";
+    let attempts = 0;
+
+    while (attempts < 10) {
+      const suffix = Math.floor(1000 + Math.random() * 9000);
+      const candidate = `${baseUsername}${suffix}`.slice(0, 20);
+
+      const usernameCheck = await db.collection("users")
+        .where("usernameLower", "==", candidate)
+        .limit(1)
+        .get();
+
+      if (usernameCheck.empty) {
+        username = candidate;
+        break;
+      }
+
+      attempts++;
+    }
+
+    if (!username) {
+      return res.status(500).json({ error: "Impossible de générer un username unique" });
+    }
+
+    await userRef.set({
+      uid,
+      prenom: cleanPrenom,
+      nom: cleanNom,
+      username,
+      usernameLower: username,
+      email,
+      phone: cleanPhone,
+      bio: "",
+      avatar: "",
+      followersCount: 0,
+      followingCount: 0,
+      totalLikes: 0,
+      wallet: 0,
+      walletLocked: 0,
+      walletEarned: 0,
+      role: "user",
+      verified: false,
+      profileCompleted: false,
+      suspended: false,
+      security: {
+          enabled: false
+        },
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    return res.json({ success: true });
+
+  } catch (e) {
+    console.log("INIT USER PROFILE ERROR:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// SERVER
+app.listen(3000, "0.0.0.0", ()=>{
+console.log("HaytiClip gift server running on port 3000");
+});

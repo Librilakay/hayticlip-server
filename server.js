@@ -87,6 +87,14 @@ const upload = multer({
   }
 });
 
+
+// 👇 NOUVEL OUTIL MÉMOIRE (Pour éviter le bug Render) 👇
+const uploadMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
+
+
 // FIREBASE ADMIN
 let serviceAccount;
 
@@ -3178,8 +3186,8 @@ app.get("/", (req, res) => {
    TRANSFERTS MANUELS (RECHARGE & RETRAIT P2P)
 ======================================================= */
 
-// 1. SOUMISSION PAR L'UTILISATEUR
-app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), async (req, res) => {
+// 1. SOUMISSION PAR L'UTILISATEUR (Utilisation de uploadMemory !)
+app.post("/api/manual-transfer", verifyFirebaseToken, uploadMemory.single("receipt"), async (req, res) => {
   try {
     const uid = req.user.uid;
     const body = req.body; 
@@ -3187,15 +3195,33 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
 
     const userRef = db.collection("users").doc(uid);
 
-    // --- LOGIQUE DE RETRAIT ---
+    // --- LOGIQUE DE RETRAIT (AVEC SÉCURITÉ PIN) ---
     if (type === "withdraw") {
       const amountReq = Number(body.amountRequested);
+      const pin = body.pin; // 👈 1. Récupération du PIN
+
+      // Vérification rapide du format
+      if (!/^\d{6}$/.test(pin || "")) {
+        return res.status(400).json({ error: "Code PIN invalide. Il doit contenir 6 chiffres." });
+      }
       
       await db.runTransaction(async (t) => {
         const userSnap = await t.get(userRef);
         if (!userSnap.exists) throw new Error("Utilisateur introuvable");
         
         const userData = userSnap.data();
+
+        // 👈 2. VÉRIFICATION BCRYPT DU PIN
+        if (!userData.security || !userData.security.pinHash) {
+          throw new Error("Veuillez d'abord configurer un code PIN dans vos paramètres de sécurité.");
+        }
+        
+        const isValidPin = await bcrypt.compare(pin, userData.security.pinHash);
+        if (!isValidPin) {
+          throw new Error("Code PIN incorrect. Opération refusée.");
+        }
+
+        // 3. Suite si le PIN est bon
         const wallet = Number(userData.wallet || 0);
         const locked = Number(userData.walletLocked || 0);
         const available = Math.max(0, wallet - locked);
@@ -3227,7 +3253,7 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
       return res.json({ success: true });
 
     } 
-    // --- LOGIQUE DE RECHARGE (AVEC SUPABASE) ---
+    // --- LOGIQUE DE RECHARGE (AVEC SUPABASE VIA MÉMOIRE) ---
     else if (type === "deposit") {
       let receiptUrl = "";
       let uploadedFileName = "";
@@ -3237,14 +3263,11 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
         const safeName = req.file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '');
         const fileName = `${uid}_${Date.now()}_${safeName}`;
         uploadedFileName = fileName;
-        
-        // Lire le fichier depuis le disque local (multer)
-        const fileContent = fs.readFileSync(req.file.path);
 
-        // Upload vers Supabase (Dossier 'media')
+        // 👈 UPLOAD DIRECT DEPUIS LA MÉMOIRE (req.file.buffer)
         const { data, error } = await supabase.storage
           .from('media') 
-          .upload(fileName, fileContent, {
+          .upload(fileName, req.file.buffer, {
             contentType: req.file.mimetype,
             upsert: false
           });
@@ -3253,15 +3276,12 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
           throw new Error("Erreur Supabase: " + error.message);
         }
 
-        // ✅ CORRIGÉ : Récupérer le lien public depuis le bon dossier ('media')
+        // Récupérer le lien public
         const { data: publicUrlData } = supabase.storage
           .from('media')
           .getPublicUrl(fileName);
 
         receiptUrl = publicUrlData.publicUrl;
-        
-        // Nettoyer le fichier local du serveur
-        fs.unlinkSync(req.file.path);
       } else {
         throw new Error("Capture d'écran obligatoire");
       }
@@ -3273,7 +3293,7 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
         amount: Number(body.amount),
         phone: body.phone,
         receiptUrl: receiptUrl,
-        receiptFileName: uploadedFileName, // 👈 On sauvegarde le nom pour pouvoir la supprimer plus tard
+        receiptFileName: uploadedFileName, 
         status: "pending",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -3283,7 +3303,6 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
 
   } catch (e) {
     console.log("MANUAL TRANSFER REQUEST ERROR:", e);
-    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     return res.status(500).json({ error: e.message });
   }
 });
@@ -3301,7 +3320,7 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
     }
 
     const transferRef = db.collection("manualTransfers").doc(transferId);
-    let imageToDelete = null; // 👈 Variable pour stocker le nom de l'image à supprimer
+    let imageToDelete = null; 
 
     await db.runTransaction(async (t) => {
       const transferSnap = await t.get(transferRef);
@@ -3386,11 +3405,9 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
           });
         }
 
-        // 👈 On prépare l'image pour la suppression (qu'elle soit approuvée ou refusée)
         if (transferData.receiptFileName) {
           imageToDelete = transferData.receiptFileName;
         } else if (transferData.receiptUrl) {
-          // Sécurité de secours si `receiptFileName` n'existe pas
           const urlParts = transferData.receiptUrl.split('/media/');
           if (urlParts.length > 1) {
             imageToDelete = decodeURIComponent(urlParts[1]);
@@ -3406,7 +3423,6 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
       });
     });
 
-    // 🗑️ SUPPRESSION DE L'IMAGE SUR SUPABASE (Hors de la transaction pour ne pas la bloquer)
     if (imageToDelete) {
       try {
         await supabase.storage.from('media').remove([imageToDelete]);
@@ -3423,8 +3439,6 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
     return res.status(500).json({ error: e.message });
   }
 });
-
-
 
 const PORT = process.env.PORT || 3000;
 

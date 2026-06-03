@@ -17,7 +17,8 @@ const express = require("express");
  const multer = require("multer"); 
 const fs = require("fs");
  const ffmpeg = require("fluent-ffmpeg");
-
+const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const app = express();
 
@@ -3170,6 +3171,233 @@ app.get("/api/admin/finance-summary", async (req, res) => {
 // SERVER
 app.get("/", (req, res) => {
   res.send("HaytiClips backend OK");
+});
+
+
+
+/* =======================================================
+   TRANSFERTS MANUELS (RECHARGE & RETRAIT P2P)
+======================================================= */
+
+// 1. SOUMISSION PAR L'UTILISATEUR
+app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const body = req.body; 
+    const type = body.type;
+
+    const userRef = db.collection("users").doc(uid);
+
+    // --- LOGIQUE DE RETRAIT ---
+    if (type === "withdraw") {
+      const amountReq = Number(body.amountRequested);
+      
+      await db.runTransaction(async (t) => {
+        const userSnap = await t.get(userRef);
+        if (!userSnap.exists) throw new Error("Utilisateur introuvable");
+        
+        const userData = userSnap.data();
+        const wallet = Number(userData.wallet || 0);
+        const locked = Number(userData.walletLocked || 0);
+        const available = Math.max(0, wallet - locked);
+
+        if (available < amountReq) {
+          throw new Error("Solde disponible insuffisant");
+        }
+
+        // Bloquer l'argent
+        t.update(userRef, {
+          walletLocked: locked + amountReq
+        });
+
+        const transferRef = db.collection("manualTransfers").doc();
+        t.set(transferRef, {
+          userId: uid,
+          type: "withdraw",
+          method: body.method,
+          amountRequested: amountReq,
+          feeApplied: Number(body.feeApplied),
+          amountToReceive: Number(body.amountToReceive),
+          phone: body.phone,
+          accountName: body.accountName,
+          status: "pending",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      });
+
+      return res.json({ success: true });
+
+    } 
+    // --- LOGIQUE DE RECHARGE (AVEC SUPABASE) ---
+    else if (type === "deposit") {
+      let receiptUrl = "";
+
+      if (req.file) {
+        // Nettoyer le nom du fichier pour éviter les bugs
+        const safeName = req.file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '');
+        const fileName = `${uid}_${Date.now()}_${safeName}`;
+        
+        // Lire le fichier depuis le disque local (multer)
+        const fileContent = fs.readFileSync(req.file.path);
+
+        // Upload vers Supabase (Remplace "receipts" par le nom exact de ton bucket)
+        const { data, error } = await supabase.storage
+          .from('media') 
+          .upload(fileName, fileContent, {
+            contentType: req.file.mimetype,
+            upsert: false
+          });
+
+        if (error) {
+          throw new Error("Erreur Supabase: " + error.message);
+        }
+
+        // Récupérer le lien public
+        const { data: publicUrlData } = supabase.storage
+          .from('receipts')
+          .getPublicUrl(fileName);
+
+        receiptUrl = publicUrlData.publicUrl;
+        
+        // Nettoyer le fichier local du serveur
+        fs.unlinkSync(req.file.path);
+      } else {
+        throw new Error("Capture d'écran obligatoire");
+      }
+
+      await db.collection("manualTransfers").add({
+        userId: uid,
+        type: "deposit",
+        method: body.method,
+        amount: Number(body.amount),
+        phone: body.phone,
+        receiptUrl: receiptUrl,
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return res.json({ success: true });
+    }
+
+  } catch (e) {
+    console.log("MANUAL TRANSFER REQUEST ERROR:", e);
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// 2. VALIDATION / REFUS PAR L'ADMIN
+app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, res) => {
+  try {
+    const adminUid = req.user.uid;
+    const { transferId, status, reason } = req.body;
+
+    const adminRef = db.collection("users").doc(adminUid);
+    const adminSnap = await adminRef.get();
+    if (!adminSnap.exists || adminSnap.data().role !== "admin") {
+      return res.status(403).json({ error: "Accès refusé" });
+    }
+
+    const transferRef = db.collection("manualTransfers").doc(transferId);
+
+    await db.runTransaction(async (t) => {
+      const transferSnap = await t.get(transferRef);
+      if (!transferSnap.exists) throw new Error("Transfert introuvable");
+
+      const transferData = transferSnap.data();
+      if (transferData.status !== "pending") {
+        throw new Error("Ce transfert a déjà été traité");
+      }
+
+      const userRef = db.collection("users").doc(transferData.userId);
+      const userSnap = await t.get(userRef);
+      if (!userSnap.exists) throw new Error("Utilisateur introuvable");
+      
+      const userData = userSnap.data();
+      const wallet = Number(userData.wallet || 0);
+      const locked = Number(userData.walletLocked || 0);
+
+      // --- LOGIQUE RETRAIT ---
+      if (transferData.type === "withdraw") {
+        const amountReq = Number(transferData.amountRequested);
+        
+        if (status === "approved") {
+          t.update(userRef, {
+            wallet: Math.max(0, wallet - amountReq),
+            walletLocked: Math.max(0, locked - amountReq)
+          });
+          
+          const txRef = db.collection("walletTransactions").doc();
+          t.set(txRef, {
+            userId: transferData.userId,
+            type: "manual_withdraw_approved",
+            amount: amountReq,
+            status: "completed",
+            balanceAfter: Math.max(0, wallet - amountReq),
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+
+        } else if (status === "rejected") {
+          t.update(userRef, {
+            walletLocked: Math.max(0, locked - amountReq)
+          });
+          
+          const notifRef = db.collection("notifications").doc();
+          t.set(notifRef, {
+            to: transferData.userId,
+            from: adminUid,
+            type: "transfer_rejected",
+            message: `Votre demande de retrait de ${amountReq} HTG a été refusée. Motif : ${reason}`,
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+      } 
+      // --- LOGIQUE RECHARGE ---
+      else if (transferData.type === "deposit") {
+        const amount = Number(transferData.amount);
+        
+        if (status === "approved") {
+          const newWallet = wallet + amount;
+          t.update(userRef, { wallet: newWallet });
+          
+          const txRef = db.collection("walletTransactions").doc();
+          t.set(txRef, {
+            userId: transferData.userId,
+            type: "manual_deposit_approved",
+            amount: amount,
+            status: "completed",
+            balanceAfter: newWallet,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+
+        } else if (status === "rejected") {
+          const notifRef = db.collection("notifications").doc();
+          t.set(notifRef, {
+            to: transferData.userId,
+            from: adminUid,
+            type: "transfer_rejected",
+            message: `Votre recharge de ${amount} HTG a été refusée. Motif : ${reason}`,
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+      }
+
+      t.update(transferRef, {
+        status: status,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        processedBy: adminUid,
+        rejectReason: status === "rejected" ? reason : ""
+      });
+    });
+
+    return res.json({ success: true });
+    
+  } catch (e) {
+    console.error("ADMIN PROCESS TRANSFER ERROR:", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;

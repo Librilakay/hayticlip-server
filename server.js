@@ -3174,7 +3174,6 @@ app.get("/", (req, res) => {
 });
 
 
-
 /* =======================================================
    TRANSFERTS MANUELS (RECHARGE & RETRAIT P2P)
 ======================================================= */
@@ -3231,16 +3230,18 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
     // --- LOGIQUE DE RECHARGE (AVEC SUPABASE) ---
     else if (type === "deposit") {
       let receiptUrl = "";
+      let uploadedFileName = "";
 
       if (req.file) {
         // Nettoyer le nom du fichier pour éviter les bugs
         const safeName = req.file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '');
         const fileName = `${uid}_${Date.now()}_${safeName}`;
+        uploadedFileName = fileName;
         
         // Lire le fichier depuis le disque local (multer)
         const fileContent = fs.readFileSync(req.file.path);
 
-        // Upload vers Supabase (Remplace "receipts" par le nom exact de ton bucket)
+        // Upload vers Supabase (Dossier 'media')
         const { data, error } = await supabase.storage
           .from('media') 
           .upload(fileName, fileContent, {
@@ -3252,9 +3253,9 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
           throw new Error("Erreur Supabase: " + error.message);
         }
 
-        // Récupérer le lien public
+        // ✅ CORRIGÉ : Récupérer le lien public depuis le bon dossier ('media')
         const { data: publicUrlData } = supabase.storage
-          .from('receipts')
+          .from('media')
           .getPublicUrl(fileName);
 
         receiptUrl = publicUrlData.publicUrl;
@@ -3272,6 +3273,7 @@ app.post("/api/manual-transfer", verifyFirebaseToken, upload.single("receipt"), 
         amount: Number(body.amount),
         phone: body.phone,
         receiptUrl: receiptUrl,
+        receiptFileName: uploadedFileName, // 👈 On sauvegarde le nom pour pouvoir la supprimer plus tard
         status: "pending",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -3299,6 +3301,7 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
     }
 
     const transferRef = db.collection("manualTransfers").doc(transferId);
+    let imageToDelete = null; // 👈 Variable pour stocker le nom de l'image à supprimer
 
     await db.runTransaction(async (t) => {
       const transferSnap = await t.get(transferRef);
@@ -3382,6 +3385,17 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
             createdAt: admin.firestore.FieldValue.serverTimestamp()
           });
         }
+
+        // 👈 On prépare l'image pour la suppression (qu'elle soit approuvée ou refusée)
+        if (transferData.receiptFileName) {
+          imageToDelete = transferData.receiptFileName;
+        } else if (transferData.receiptUrl) {
+          // Sécurité de secours si `receiptFileName` n'existe pas
+          const urlParts = transferData.receiptUrl.split('/media/');
+          if (urlParts.length > 1) {
+            imageToDelete = decodeURIComponent(urlParts[1]);
+          }
+        }
       }
 
       t.update(transferRef, {
@@ -3392,6 +3406,16 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
       });
     });
 
+    // 🗑️ SUPPRESSION DE L'IMAGE SUR SUPABASE (Hors de la transaction pour ne pas la bloquer)
+    if (imageToDelete) {
+      try {
+        await supabase.storage.from('media').remove([imageToDelete]);
+        console.log("✅ Image supprimée de Supabase :", imageToDelete);
+      } catch (deleteErr) {
+        console.error("❌ Erreur lors de la suppression Supabase :", deleteErr.message);
+      }
+    }
+
     return res.json({ success: true });
     
   } catch (e) {
@@ -3399,6 +3423,8 @@ app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, 
     return res.status(500).json({ error: e.message });
   }
 });
+
+
 
 const PORT = process.env.PORT || 3000;
 

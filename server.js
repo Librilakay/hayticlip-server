@@ -416,11 +416,28 @@ return res.status(404).json({error:"creator not found"});
 // TRANSACTION
 await db.runTransaction(async t=>{
 
+  // 1️⃣ --- TOUTES LES LECTURES (READS) EN PREMIER ---
   const senderDoc = await t.get(senderRef);
   if(!senderDoc.exists){
     throw new Error("sender not found");
   }
 
+  const creatorDoc = await t.get(creatorRef);
+  if(!creatorDoc.exists){
+    throw new Error("creator not found");
+  }
+
+  const adminDoc = await t.get(adminRef);
+  if(!adminDoc.exists){
+    throw new Error("admin not found");
+  }
+
+  // 🔥 LECTURE DES STATS REMONTÉE ICI (Avant les écritures !)
+  const statsRef = db.collection("adminStats").doc("finance");
+  const statsDoc = await t.get(statsRef);
+
+
+  // 2️⃣ --- PRÉPARATION DES DONNÉES ---
   const senderData = senderDoc.data() || {};
   const { wallet, available } = getMoneyState(senderData);
 
@@ -435,19 +452,9 @@ await db.runTransaction(async t=>{
   const senderWallet = Number(senderData.wallet || 0);
   const newSenderBalance = senderWallet - giftAmount;
 
-  const creatorDoc = await t.get(creatorRef);
-  if(!creatorDoc.exists){
-    throw new Error("creator not found");
-  }
-
   const creatorData = creatorDoc.data() || {};
   const creatorWallet = Number(creatorData.wallet || 0);
   const creatorEarned = Number(creatorData.walletEarned || 0);
-
-  const adminDoc = await t.get(adminRef);
-  if(!adminDoc.exists){
-    throw new Error("admin not found");
-  }
 
   const adminData = adminDoc.data() || {};
   const adminWallet = Number(adminData.wallet || 0);
@@ -459,6 +466,8 @@ await db.runTransaction(async t=>{
   const adminTx = db.collection("walletTransactions").doc();
   const notifRef = db.collection("notifications").doc();
 
+  // 3️⃣ --- TOUTES LES ÉCRITURES (WRITES) ENSUITE ---
+  
   // Débiter l’envoyeur
   t.update(senderRef,{
     wallet: newSenderBalance
@@ -577,41 +586,32 @@ await db.runTransaction(async t=>{
     createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
 
+  // 🔥 MISE À JOUR ADMIN STATS - GIFT
+  let stats = statsDoc.exists ? statsDoc.data() : {
+    totalIn: 0,
+    totalOut: 0,
+    netTotal: 0,
+    transactionsCount: 0,
+    typeTotals: {}
+  };
 
+  const amountValue = gift.admin;
+  const type = "gift_commission_received";
 
+  if(!stats.typeTotals[type]){
+    stats.typeTotals[type] = { in:0, out:0, count:0 };
+  }
 
+  stats.totalIn += amountValue;
+  stats.transactionsCount += 1;
+  stats.typeTotals[type].in += amountValue;
+  stats.typeTotals[type].count += 1;
+  stats.netTotal = stats.totalIn - stats.totalOut;
 
-
-
-// 🔥 ADMIN STATS - GIFT
-const statsRef = db.collection("adminStats").doc("finance");
-
-const statsDoc = await t.get(statsRef);
-
-let stats = statsDoc.exists ? statsDoc.data() : {
-  totalIn: 0,
-  totalOut: 0,
-  netTotal: 0,
-  transactionsCount: 0,
-  typeTotals: {}
-};
-
-const amountValue = gift.admin;
-const type = "gift_commission_received";
-
-if(!stats.typeTotals[type]){
-  stats.typeTotals[type] = { in:0, out:0, count:0 };
-}
-
-stats.totalIn += amountValue;
-stats.transactionsCount += 1;
-stats.typeTotals[type].in += amountValue;
-stats.typeTotals[type].count += 1;
-stats.netTotal = stats.totalIn - stats.totalOut;
-
-t.set(statsRef, stats);
+  t.set(statsRef, stats);
 
 });
+
 
 res.json({ success: true });
 

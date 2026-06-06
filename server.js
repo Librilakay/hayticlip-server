@@ -124,12 +124,12 @@ if (!ADMIN_UID) {
   throw new Error("ADMIN_UID manquant dans les variables d'environnement");
 }
 
-const MERCHANT_RENEWAL_AMOUNT = 750;
+const MERCHANT_RENEWAL_AMOUNT = 250;
 const MERCHANT_RENEWAL_DAYS = 30;
-const MERCHANT_APPROVAL_REFERRER_REWARD = 1000;
-const MERCHANT_APPROVAL_ADMIN_FEE = 500;
-const MERCHANT_RENEWAL_REFERRER_REWARD = 500;
-const MERCHANT_RENEWAL_ADMIN_FEE = 250;
+const MERCHANT_APPROVAL_REFERRER_REWARD = 500;
+const MERCHANT_APPROVAL_ADMIN_FEE = 250;
+const MERCHANT_RENEWAL_REFERRER_REWARD = 200;
+const MERCHANT_RENEWAL_ADMIN_FEE = 50;
 const MERCHANT_SALE_ADMIN_FEE = 10;
 
 const MONCASH_MODE = "sandbox"; // change en "live" plus tard
@@ -184,12 +184,12 @@ if(!allowed.includes(amount)){
 return null;
 }
 
-if(amount === 25) return {creator:15, admin:10};
-if(amount === 50) return {creator:35, admin:15};
-if(amount === 100) return {creator:75, admin:25};
-if(amount === 250) return {creator:200, admin:50};
-if(amount === 500) return {creator:400, admin:100};
-if(amount === 1000) return {creator:800, admin:200};
+if(amount === 25) return {creator:20, admin:5};
+if(amount === 50) return {creator:43, admin:7};
+if(amount === 100) return {creator:90, admin:10};
+if(amount === 250) return {creator:235, admin:15};
+if(amount === 500) return {creator:475, admin:25};
+if(amount === 1000) return {creator:970, admin:30};
 
 return null;
 }
@@ -1517,7 +1517,7 @@ app.post("/api/requestMerchantAccess", verifyFirebaseToken, async (req,res)=>{
 
 const money = getMoneyState(userData);
 
-if(money.available < 1500){
+if(money.available < 750){
   return res.status(400).json({error:"Solde disponible insuffisant"});
 }
 
@@ -1546,11 +1546,11 @@ if(money.available < 1500){
 
 const { wallet, available } = getMoneyState(freshUser);
 
-if(available < 1500){
+if(available < 750){
   throw new Error("Solde disponible insuffisant");
 }
 
-const newWallet = wallet - 1500;
+const newWallet = wallet - 750;
       t.update(userRef,{
         wallet: newWallet,
         merchantStatus: "pending",
@@ -1566,7 +1566,7 @@ const newWallet = wallet - 1500;
         productType: cleanProductType,
         referralCode: cleanReferralCode,
         referrerUid,
-        amountPaid: 1500,
+        amountPaid: 750,
         status: "pending",
         reviewedBy: null,
         reviewedAt: null,
@@ -1579,7 +1579,7 @@ const newWallet = wallet - 1500;
       t.set(txRef,{
         userId: uid,
         type: "merchant_request_payment",
-        amount: 1500,
+        amount: 750,
         status: "completed",
         merchantRequestId: requestRef.id,
         balanceAfter: newWallet,
@@ -1756,7 +1756,7 @@ app.post("/api/rejectMerchant", verifyFirebaseToken, async (req,res)=>{
       if(!userSnap.exists) throw new Error("Utilisateur introuvable");
 
       const userData = userSnap.data() || {};
-      const newWallet = Number(userData.wallet || 0) + 1500;
+      const newWallet = Number(userData.wallet || 0) + 750;
 
       t.update(userRef,{
         wallet: newWallet,
@@ -1777,7 +1777,7 @@ app.post("/api/rejectMerchant", verifyFirebaseToken, async (req,res)=>{
       t.set(refundTx,{
         userId: requestData.uid,
         type: "merchant_request_refund",
-        amount: 1500,
+        amount: 750,
         status: "completed",
         merchantRequestId: requestId,
         balanceAfter: newWallet,

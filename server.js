@@ -413,49 +413,35 @@ return res.status(404).json({error:"creator not found"});
 }
 
 
+
 // TRANSACTION
 await db.runTransaction(async t=>{
 
-  // 1️⃣ --- TOUTES LES LECTURES (READS) EN PREMIER ---
+  // 1️⃣ --- TOUTES LES LECTURES (READS) ---
   const senderDoc = await t.get(senderRef);
-  if(!senderDoc.exists){
-    throw new Error("sender not found");
-  }
-
+  if(!senderDoc.exists) throw new Error("sender not found");
+  
   const creatorDoc = await t.get(creatorRef);
-  if(!creatorDoc.exists){
-    throw new Error("creator not found");
-  }
-
+  if(!creatorDoc.exists) throw new Error("creator not found");
+  
   const adminDoc = await t.get(adminRef);
-  if(!adminDoc.exists){
-    throw new Error("admin not found");
-  }
-
-  // 🔥 LECTURE DES STATS REMONTÉE ICI (Avant les écritures !)
+  if(!adminDoc.exists) throw new Error("admin not found");
+  
   const statsRef = db.collection("adminStats").doc("finance");
   const statsDoc = await t.get(statsRef);
-
 
   // 2️⃣ --- PRÉPARATION DES DONNÉES ---
   const senderData = senderDoc.data() || {};
   const { wallet, available } = getMoneyState(senderData);
 
-  if(wallet <= 0){
-    throw new Error("wallet empty");
-  }
-
-  if(available < giftAmount){
-    throw new Error("Solde disponible insuffisant");
-  }
+  if(wallet <= 0) throw new Error("wallet empty");
+  if(available < giftAmount) throw new Error("Solde disponible insuffisant");
 
   const senderWallet = Number(senderData.wallet || 0);
-  const newSenderBalance = senderWallet - giftAmount;
-
   const creatorData = creatorDoc.data() || {};
   const creatorWallet = Number(creatorData.wallet || 0);
   const creatorEarned = Number(creatorData.walletEarned || 0);
-
+  
   const adminData = adminDoc.data() || {};
   const adminWallet = Number(adminData.wallet || 0);
   const adminEarned = Number(adminData.walletEarned || 0);
@@ -466,24 +452,20 @@ await db.runTransaction(async t=>{
   const adminTx = db.collection("walletTransactions").doc();
   const notifRef = db.collection("notifications").doc();
 
-  // 3️⃣ --- TOUTES LES ÉCRITURES (WRITES) ENSUITE ---
-  
-  // Débiter l’envoyeur
-  t.update(senderRef,{
-    wallet: newSenderBalance
-  });
+  const isSenderAdmin = (fromUser === ADMIN_UID);
+  const isCreatorAdmin = (creatorId === ADMIN_UID);
 
-  // Cas spécial : l’admin reçoit le cadeau
-  if(creatorId === ADMIN_UID){
+  // 3️⃣ --- TOUTES LES ÉCRITURES (WRITES) SANS CONFLITS ---
 
+  if (isCreatorAdmin) {
+    // CAS 1 : UN UTILISATEUR NORMAL ENVOIE À L'ADMIN
+    const newSenderBalance = senderWallet - giftAmount;
     const totalAdminGain = gift.creator + gift.admin;
     const newAdminBalance = adminWallet + totalAdminGain;
     const newAdminEarned = adminEarned + totalAdminGain;
 
-    t.update(adminRef,{
-      wallet: newAdminBalance,
-      walletEarned: newAdminEarned
-    });
+    t.update(senderRef, { wallet: newSenderBalance });
+    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
 
     t.set(receiverTx,{
       userId: ADMIN_UID,
@@ -508,23 +490,52 @@ await db.runTransaction(async t=>{
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-  } else {
-
+  } else if (isSenderAdmin) {
+    // CAS 2 : L'ADMIN ENVOIE À UN UTILISATEUR NORMAL
     const newCreatorBalance = creatorWallet + gift.creator;
     const newCreatorEarned = creatorEarned + gift.creator;
+    
+    // 🔥 CORRECTION ICI : L'admin paie le total (giftAmount), mais récupère sa propre taxe (gift.admin).
+    const newAdminBalance = adminWallet - giftAmount + gift.admin;
+    const newAdminEarned = adminEarned + gift.admin;
 
+    t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
+    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
+
+    t.set(receiverTx,{
+      userId: creatorId,
+      type: "gift_received",
+      amount: gift.creator,
+      senderId: fromUser,
+      videoId: videoId,
+      balanceAfter: newCreatorBalance,
+      status: "completed",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    t.set(adminTx,{
+      userId: ADMIN_UID,
+      type: "gift_commission_received",
+      amount: gift.admin,
+      senderId: fromUser,
+      receiverId: creatorId,
+      videoId: videoId,
+      balanceAfter: newAdminBalance,
+      status: "completed",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+  } else {
+    // CAS 3 : UN UTILISATEUR NORMAL ENVOIE À UN AUTRE UTILISATEUR NORMAL
+    const newSenderBalance = senderWallet - giftAmount;
+    const newCreatorBalance = creatorWallet + gift.creator;
+    const newCreatorEarned = creatorEarned + gift.creator;
     const newAdminBalance = adminWallet + gift.admin;
     const newAdminEarned = adminEarned + gift.admin;
 
-    t.update(creatorRef,{
-      wallet: newCreatorBalance,
-      walletEarned: newCreatorEarned
-    });
-
-    t.update(adminRef,{
-      wallet: newAdminBalance,
-      walletEarned: newAdminEarned
-    });
+    t.update(senderRef, { wallet: newSenderBalance });
+    t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
+    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
 
     t.set(receiverTx,{
       userId: creatorId,
@@ -561,14 +572,17 @@ await db.runTransaction(async t=>{
     createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
 
-  // Transaction envoyeur
+  // Transaction de sortie (Wallet)
+  let finalSenderBalForTx = senderWallet - giftAmount;
+  if(isSenderAdmin) finalSenderBalForTx = adminWallet - giftAmount + gift.admin;
+
   t.set(senderTx,{
     userId: fromUser,
     type: "gift_sent",
     amount: giftAmount,
     receiverId: creatorId,
     videoId: videoId,
-    balanceAfter: newSenderBalance,
+    balanceAfter: finalSenderBalForTx,
     status: "completed",
     createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
@@ -596,16 +610,16 @@ await db.runTransaction(async t=>{
   };
 
   const amountValue = gift.admin;
-  const type = "gift_commission_received";
+  const typeStat = "gift_commission_received";
 
-  if(!stats.typeTotals[type]){
-    stats.typeTotals[type] = { in:0, out:0, count:0 };
+  if(!stats.typeTotals[typeStat]){
+    stats.typeTotals[typeStat] = { in:0, out:0, count:0 };
   }
 
   stats.totalIn += amountValue;
   stats.transactionsCount += 1;
-  stats.typeTotals[type].in += amountValue;
-  stats.typeTotals[type].count += 1;
+  stats.typeTotals[typeStat].in += amountValue;
+  stats.typeTotals[typeStat].count += 1;
   stats.netTotal = stats.totalIn - stats.totalOut;
 
   t.set(statsRef, stats);

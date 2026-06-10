@@ -2690,7 +2690,7 @@ const newUserWallet = wallet - MERCHANT_RENEWAL_AMOUNT;
 app.post("/api/blue/request-payment", verifyFirebaseToken, async (req,res)=>{
   try{
     const uid = req.user.uid;
-    const amount = 2000;
+    const amount = 250;
 
     const userRef = db.collection("users").doc(uid);
 

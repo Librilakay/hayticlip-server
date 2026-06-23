@@ -1912,10 +1912,12 @@ app.post("/api/disableMerchantReferrer", verifyFirebaseToken, async (req,res)=>{
   }
 });
 
+
+
 app.post("/api/removeMerchantAccess", verifyFirebaseToken, async (req,res)=>{
   try{
     const staffUid = req.user.uid;
-    const { targetUid } = req.body;
+    const { targetUid, imagesToDelete } = req.body; // 👈 Récupération de la liste des images
 
     if(typeof targetUid !== "string" || !targetUid.trim()){
       return res.status(400).json({error:"Utilisateur cible invalide"});
@@ -1947,14 +1949,31 @@ app.post("/api/removeMerchantAccess", verifyFirebaseToken, async (req,res)=>{
       return res.status(400).json({error:"Ce compte marchand n’est pas actif"});
     }
 
+    await userRef.update({
+      merchantStatus: "none",
+      merchantEnabled: false,
+      merchantApprovedAt: null,
+      merchantApprovedBy: null,
+      merchantRenewalBlocked: true
+    });
 
-await userRef.update({
-  merchantStatus: "none",
-  merchantEnabled: false,
-  merchantApprovedAt: null,
-  merchantApprovedBy: null,
-  merchantRenewalBlocked: true
-});
+    // 🔥 NOUVEAU : Suppression physique des images dans Supabase
+    if (imagesToDelete && Array.isArray(imagesToDelete) && imagesToDelete.length > 0) {
+      // On extrait juste le nom de l'image à partir de l'URL publique
+      const fileNames = imagesToDelete.map(url => {
+        const urlParts = url.split('/media/');
+        return urlParts.length > 1 ? decodeURIComponent(urlParts[1]) : null;
+      }).filter(name => name !== null);
+
+      if (fileNames.length > 0) {
+        try {
+          await supabase.storage.from('media').remove(fileNames);
+          console.log(`✅ ${fileNames.length} images supprimées de Supabase pour l'UID: ${targetUid}`);
+        } catch (err) {
+          console.error("❌ Erreur Supabase lors de la suppression :", err.message);
+        }
+      }
+    }
 
     return res.json({success:true});
 
@@ -1963,6 +1982,7 @@ await userRef.update({
     return res.status(500).json({error:e.message});
   }
 });
+
 
 app.post("/api/merchant/buy-product", verifyFirebaseToken, async (req,res)=>{
   try{

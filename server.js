@@ -2109,6 +2109,8 @@ const newLocked = walletLocked + total;
   }
 });
 
+
+
 app.post("/api/merchant/accept-order", verifyFirebaseToken, async (req,res)=>{
   try{
     const merchantUid = req.user.uid;
@@ -2133,10 +2135,13 @@ app.post("/api/merchant/accept-order", verifyFirebaseToken, async (req,res)=>{
       const merchantRef = db.collection("users").doc(merchantUid);
       const buyerRef = db.collection("users").doc(order.buyerUid);
       const adminRef = db.collection("users").doc(ADMIN_UID);
+      const statsRef = db.collection("adminStats").doc("finance"); // 👈 DÉCLARATION ICI
 
+      // 🔥 TOUTES LES LECTURES EN PREMIER 🔥
       const merchantSnap = await t.get(merchantRef);
       const buyerSnap = await t.get(buyerRef);
       const adminSnap = await t.get(adminRef);
+      const statsDoc = await t.get(statsRef); // 👈 LECTURE DÉPLACÉE ICI EN HAUT
 
       if(!merchantSnap.exists) throw new Error("Marchand introuvable");
       if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
@@ -2164,39 +2169,39 @@ app.post("/api/merchant/accept-order", verifyFirebaseToken, async (req,res)=>{
       const saleFee = Math.min(MERCHANT_SALE_ADMIN_FEE, total);
       const merchantNet = total - saleFee;
 
+      const newBuyerLocked = buyerLocked - total;
 
-const newBuyerLocked = buyerLocked - total;
+      let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
+      let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
+      let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
+      let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
 
-let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
-let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
-let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
-let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
+      // 🔥 TOUTES LES ÉCRITURES ENSUITE 🔥
+      t.update(buyerRef,{
+        walletLocked: newBuyerLocked
+      });
 
-t.update(buyerRef,{
-  walletLocked: newBuyerLocked
-});
+      if(merchantUid === ADMIN_UID){
+        newMerchantWallet = Number(adminData.wallet || 0) + total;
+        newMerchantEarned = Number(adminData.walletEarned || 0) + total;
+        newAdminWallet = newMerchantWallet;
+        newAdminEarned = newMerchantEarned;
 
-if(merchantUid === ADMIN_UID){
-  newMerchantWallet = Number(adminData.wallet || 0) + total;
-  newMerchantEarned = Number(adminData.walletEarned || 0) + total;
-  newAdminWallet = newMerchantWallet;
-  newAdminEarned = newMerchantEarned;
+        t.update(adminRef,{
+          wallet: newAdminWallet,
+          walletEarned: newAdminEarned
+        });
+      }else{
+        t.update(merchantRef,{
+          wallet: newMerchantWallet,
+          walletEarned: newMerchantEarned
+        });
 
-  t.update(adminRef,{
-    wallet: newAdminWallet,
-    walletEarned: newAdminEarned
-  });
-}else{
-  t.update(merchantRef,{
-    wallet: newMerchantWallet,
-    walletEarned: newMerchantEarned
-  });
-
-  t.update(adminRef,{
-    wallet: newAdminWallet,
-    walletEarned: newAdminEarned
-  });
-}
+        t.update(adminRef,{
+          wallet: newAdminWallet,
+          walletEarned: newAdminEarned
+        });
+      }
 
       t.update(orderRef,{
         status: "accepted",
@@ -2236,37 +2241,29 @@ if(merchantUid === ADMIN_UID){
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
+      // 🔥 MISE À JOUR ADMIN STATS (SANS FAIRE DE LECTURE ICI) 🔥
+      let stats = statsDoc.exists ? statsDoc.data() : {
+        totalIn: 0,
+        totalOut: 0,
+        netTotal: 0,
+        transactionsCount: 0,
+        typeTotals: {}
+      };
 
-// 🔥 ADMIN STATS - MERCHANT SALE
-const statsRef = db.collection("adminStats").doc("finance");
+      const amountValue = saleFee;
+      const type = "merchant_sale_fee";
 
-const statsDoc = await t.get(statsRef);
+      if(!stats.typeTotals[type]){
+        stats.typeTotals[type] = { in:0, out:0, count:0 };
+      }
 
-let stats = statsDoc.exists ? statsDoc.data() : {
-  totalIn: 0,
-  totalOut: 0,
-  netTotal: 0,
-  transactionsCount: 0,
-  typeTotals: {}
-};
+      stats.totalIn += amountValue;
+      stats.transactionsCount += 1;
+      stats.typeTotals[type].in += amountValue;
+      stats.typeTotals[type].count += 1;
+      stats.netTotal = stats.totalIn - stats.totalOut;
 
-const amountValue = saleFee;
-const type = "merchant_sale_fee";
-
-if(!stats.typeTotals[type]){
-  stats.typeTotals[type] = { in:0, out:0, count:0 };
-}
-
-stats.totalIn += amountValue;
-stats.transactionsCount += 1;
-stats.typeTotals[type].in += amountValue;
-stats.typeTotals[type].count += 1;
-stats.netTotal = stats.totalIn - stats.totalOut;
-
-t.set(statsRef, stats);
-
-
-
+      t.set(statsRef, stats); // 👈 ÉCRITURE DES STATS
 
       t.set(buyerTxRef,{
         userId: order.buyerUid,
@@ -2387,6 +2384,7 @@ app.post("/api/merchant/reject-order", verifyFirebaseToken, async (req,res)=>{
 });
 
 
+
 app.post("/api/merchant/complete-order", verifyFirebaseToken, async (req,res)=>{
   try{
     const merchantUid = req.user.uid;
@@ -2414,10 +2412,13 @@ app.post("/api/merchant/complete-order", verifyFirebaseToken, async (req,res)=>{
       const merchantRef = db.collection("users").doc(merchantUid);
       const buyerRef = db.collection("users").doc(order.buyerUid);
       const adminRef = db.collection("users").doc(ADMIN_UID);
+      const statsRef = db.collection("adminStats").doc("finance"); // 👈 DÉCLARATION ICI
 
+      // 🔥 TOUTES LES LECTURES EN PREMIER 🔥
       const merchantSnap = await t.get(merchantRef);
       const buyerSnap = await t.get(buyerRef);
       const adminSnap = await t.get(adminRef);
+      const statsDoc = await t.get(statsRef); // 👈 LECTURE DÉPLACÉE ICI EN HAUT
 
       if(!merchantSnap.exists) throw new Error("Marchand introuvable");
       if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
@@ -2446,39 +2447,39 @@ app.post("/api/merchant/complete-order", verifyFirebaseToken, async (req,res)=>{
         const saleFee = Math.min(MERCHANT_SALE_ADMIN_FEE, total);
         const merchantNet = total - saleFee;
 
+        const newBuyerLocked = buyerLocked - total;
 
-const newBuyerLocked = buyerLocked - total;
+        let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
+        let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
+        let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
+        let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
 
-let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
-let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
-let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
-let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
+        // 🔥 TOUTES LES ÉCRITURES ENSUITE 🔥
+        t.update(buyerRef,{
+          walletLocked: newBuyerLocked
+        });
 
-t.update(buyerRef,{
-  walletLocked: newBuyerLocked
-});
+        if(merchantUid === ADMIN_UID){
+          newMerchantWallet = Number(adminData.wallet || 0) + total;
+          newMerchantEarned = Number(adminData.walletEarned || 0) + total;
+          newAdminWallet = newMerchantWallet;
+          newAdminEarned = newMerchantEarned;
 
-if(merchantUid === ADMIN_UID){
-  newMerchantWallet = Number(adminData.wallet || 0) + total;
-  newMerchantEarned = Number(adminData.walletEarned || 0) + total;
-  newAdminWallet = newMerchantWallet;
-  newAdminEarned = newMerchantEarned;
+          t.update(adminRef,{
+            wallet: newAdminWallet,
+            walletEarned: newAdminEarned
+          });
+        }else{
+          t.update(merchantRef,{
+            wallet: newMerchantWallet,
+            walletEarned: newMerchantEarned
+          });
 
-  t.update(adminRef,{
-    wallet: newAdminWallet,
-    walletEarned: newAdminEarned
-  });
-}else{
-  t.update(merchantRef,{
-    wallet: newMerchantWallet,
-    walletEarned: newMerchantEarned
-  });
-
-  t.update(adminRef,{
-    wallet: newAdminWallet,
-    walletEarned: newAdminEarned
-  });
-}
+          t.update(adminRef,{
+            wallet: newAdminWallet,
+            walletEarned: newAdminEarned
+          });
+        }
 
         const merchantTxRef = db.collection("walletTransactions").doc();
         const adminTxRef = db.collection("walletTransactions").doc();
@@ -2513,41 +2514,29 @@ if(merchantUid === ADMIN_UID){
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
+        // 🔥 MISE À JOUR ADMIN STATS (SANS LECTURE ICI) 🔥
+        let stats = statsDoc.exists ? statsDoc.data() : {
+          totalIn: 0,
+          totalOut: 0,
+          netTotal: 0,
+          transactionsCount: 0,
+          typeTotals: {}
+        };
 
+        const amountValue = saleFee;
+        const type = "merchant_sale_fee";
 
+        if(!stats.typeTotals[type]){
+          stats.typeTotals[type] = { in:0, out:0, count:0 };
+        }
 
-// 🔥 ADMIN STATS - COMPLETE ORDER
-const statsRef = db.collection("adminStats").doc("finance");
+        stats.totalIn += amountValue;
+        stats.transactionsCount += 1;
+        stats.typeTotals[type].in += amountValue;
+        stats.typeTotals[type].count += 1;
+        stats.netTotal = stats.totalIn - stats.totalOut;
 
-const statsDoc = await t.get(statsRef);
-
-let stats = statsDoc.exists ? statsDoc.data() : {
-  totalIn: 0,
-  totalOut: 0,
-  netTotal: 0,
-  transactionsCount: 0,
-  typeTotals: {}
-};
-
-const amountValue = saleFee;
-const type = "merchant_sale_fee";
-
-if(!stats.typeTotals[type]){
-  stats.typeTotals[type] = { in:0, out:0, count:0 };
-}
-
-stats.totalIn += amountValue;
-stats.transactionsCount += 1;
-stats.typeTotals[type].in += amountValue;
-stats.typeTotals[type].count += 1;
-stats.netTotal = stats.totalIn - stats.totalOut;
-
-t.set(statsRef, stats);
-
-
-
-
-
+        t.set(statsRef, stats);
 
         t.set(buyerTxRef,{
           userId: order.buyerUid,

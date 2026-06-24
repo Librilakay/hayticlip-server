@@ -1914,10 +1914,11 @@ app.post("/api/disableMerchantReferrer", verifyFirebaseToken, async (req,res)=>{
 
 
 
+// 🔥 NOUVELLE LOGIQUE DE SUPPRESSION
 app.post("/api/removeMerchantAccess", verifyFirebaseToken, async (req,res)=>{
   try{
     const staffUid = req.user.uid;
-    const { targetUid, imagesToDelete } = req.body; // 👈 Récupération de la liste des images
+    const { targetUid, imagesToDelete } = req.body;
 
     if(typeof targetUid !== "string" || !targetUid.trim()){
       return res.status(400).json({error:"Utilisateur cible invalide"});
@@ -1949,29 +1950,50 @@ app.post("/api/removeMerchantAccess", verifyFirebaseToken, async (req,res)=>{
       return res.status(400).json({error:"Ce compte marchand n’est pas actif"});
     }
 
+    // 1. Préparer la liste de toutes les images à supprimer (Produits + Logo Boutique)
+    let fileNames = [];
+
+    // Récupérer les images des produits (envoyées par le frontend)
+    if (imagesToDelete && Array.isArray(imagesToDelete)) {
+      imagesToDelete.forEach(url => {
+        if (typeof url === 'string') {
+          const urlParts = url.split('/media/');
+          if (urlParts.length > 1) fileNames.push(decodeURIComponent(urlParts[1]));
+        }
+      });
+    }
+
+    // Récupérer le logo de la boutique depuis Firestore pour le supprimer de Supabase
+    if (userData.merchantLogo && typeof userData.merchantLogo === 'string') {
+      const logoParts = userData.merchantLogo.split('/media/');
+      if (logoParts.length > 1) {
+        fileNames.push(decodeURIComponent(logoParts[1]));
+      }
+    }
+
+    // 2. Remettre le compte marchand TOTALEMENT à zéro dans Firestore
     await userRef.update({
       merchantStatus: "none",
       merchantEnabled: false,
       merchantApprovedAt: null,
       merchantApprovedBy: null,
-      merchantRenewalBlocked: true
+      merchantExpiresAt: null,        // 🔥 Stoppe la date d'expiration pour bloquer le renouvèlement
+      merchantLastRenewedAt: null,    // 🔥 Efface la date de renouvellement
+      merchantRenewalBlocked: false,  // 🔥 Permet de refaire une VRAIE nouvelle demande plus tard
+      merchantShopName: "",           // 🔥 Efface le nom
+      merchantProductType: "",        // 🔥 Efface le type
+      merchantBio: "",                // 🔥 Efface la bio (si existante)
+      merchantLogo: null,             // 🔥 Efface le logo de la Base de Données
+      merchantReferrerUid: null       // 🔥 Efface le parrain associé
     });
 
-    // 🔥 NOUVEAU : Suppression physique des images dans Supabase
-    if (imagesToDelete && Array.isArray(imagesToDelete) && imagesToDelete.length > 0) {
-      // On extrait juste le nom de l'image à partir de l'URL publique
-      const fileNames = imagesToDelete.map(url => {
-        const urlParts = url.split('/media/');
-        return urlParts.length > 1 ? decodeURIComponent(urlParts[1]) : null;
-      }).filter(name => name !== null);
-
-      if (fileNames.length > 0) {
-        try {
-          await supabase.storage.from('media').remove(fileNames);
-          console.log(`✅ ${fileNames.length} images supprimées de Supabase pour l'UID: ${targetUid}`);
-        } catch (err) {
-          console.error("❌ Erreur Supabase lors de la suppression :", err.message);
-        }
+    // 3. Supprimer physiquement de Supabase
+    if (fileNames.length > 0) {
+      try {
+        await supabase.storage.from('media').remove(fileNames);
+        console.log(`✅ ${fileNames.length} fichiers (produits + logo) supprimés de Supabase pour l'UID: ${targetUid}`);
+      } catch (err) {
+        console.error("❌ Erreur Supabase lors de la suppression :", err.message);
       }
     }
 

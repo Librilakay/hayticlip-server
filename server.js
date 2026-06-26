@@ -22,6 +22,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const app = express();
 
+app.set('trust proxy', 1);
+
+
 const apiLimiter = rateLimit({
 windowMs: 60 * 1000,
 max: 100

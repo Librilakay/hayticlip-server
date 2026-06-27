@@ -3092,21 +3092,27 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
     inputPath = req.file.path;
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
 
+    // ⚡ OPTIMISATION EXTRÊME FFMPEG POUR LA VITESSE
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
-          "-vf scale='min(540,iw)':-2",
-          "-c:v libx264",
-          "-preset veryfast",
-          "-crf 28",
+          "-vf scale='min(480,iw)':-2", // 480p max (très rapide, qualité largement suffisante pour mobile)
+          "-r 24",                      // Limiter à 24 images/sec (réduit le temps de calcul de 20%)
+          "-c:v libx264",               // Codec standard
+          "-preset ultrafast",          // Vitesse absolue au détriment d'une très légère perte de compression
+          "-crf 30",                    // Niveau de compression plus élevé
+          "-threads 0",                 // Utiliser 100% des cœurs du processeur disponibles
           "-c:a aac",
-          "-b:a 96k",
-          "-movflags +faststart",
-          "-t 120"
+          "-b:a 64k",                   // Audio allégé
+          "-movflags +faststart",       // Permet à la vidéo de se lancer sans avoir fini de charger
+          "-max_muxing_queue_size 1024" // Évite les crashs mémoires sur les longues vidéos
         ])
         .save(outputPath)
         .on("end", resolve)
-        .on("error", reject);
+        .on("error", (err) => {
+          console.error("FFMPEG FATAL ERROR:", err);
+          reject(err);
+        });
     });
 
     res.download(outputPath, "hayticlips_compressed.mp4", () => {
@@ -3120,9 +3126,10 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
     if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
-    res.status(500).json({ error: "Compression impossible" });
+    res.status(500).json({ error: "Compression impossible ou délai dépassé." });
   }
 });
+
 
 // ================= ADMIN FINANCE SUMMARY =================
 

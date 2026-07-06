@@ -2885,19 +2885,30 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
         baseMs = userData.verification.expiresAt.toMillis();
       }
 
+
+// ... (juste au-dessus, tu as la vérification de la date d'expiration)
       const expiresAt = admin.firestore.Timestamp.fromMillis(
         baseMs + (30 * 24 * 60 * 60 * 1000)
       );
 
-      const newWallet = wallet - amount;
+      // ================= DÉBUT DES MODIFICATIONS =================
+      const isBuyerAdmin = (paymentData.userId === ADMIN_UID);
       const newLocked = walletLocked - amount;
 
-      const adminData = adminSnap.data() || {};
-      const adminWallet = Number(adminData.wallet || 0);
-      const adminEarned = Number(adminData.walletEarned || 0);
+      let newWallet = wallet;
+      let newAdminWallet = 0;
+      let newAdminEarned = 0;
+      let addedToStats = 0;
 
-      const newAdminWallet = adminWallet + amount;
-      const newAdminEarned = adminEarned + amount;
+      if (!isBuyerAdmin) {
+        // Acheteur normal : on déduit l'argent et on paie l'admin
+        newWallet = wallet - amount;
+        
+        const adminData = adminSnap.data() || {};
+        newAdminWallet = Number(adminData.wallet || 0) + amount;
+        newAdminEarned = Number(adminData.walletEarned || 0) + amount;
+        addedToStats = amount;
+      }
 
       let stats = statsDoc.exists ? statsDoc.data() : {
         totalIn: 0,
@@ -2917,57 +2928,71 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
         stats.typeTotals[type] = { in:0, out:0, count:0 };
       }
 
-      stats.totalIn = Number(stats.totalIn || 0) + amount;
-      stats.totalOut = Number(stats.totalOut || 0);
-      stats.transactionsCount = Number(stats.transactionsCount || 0) + 1;
-      stats.typeTotals[type].in = Number(stats.typeTotals[type].in || 0) + amount;
-      stats.typeTotals[type].count = Number(stats.typeTotals[type].count || 0) + 1;
-      stats.netTotal = stats.totalIn - stats.totalOut;
+      if (!isBuyerAdmin) {
+        stats.totalIn = Number(stats.totalIn || 0) + addedToStats;
+        stats.transactionsCount = Number(stats.transactionsCount || 0) + 1;
+        stats.typeTotals[type].in = Number(stats.typeTotals[type].in || 0) + addedToStats;
+        stats.typeTotals[type].count = Number(stats.typeTotals[type].count || 0) + 1;
+        stats.netTotal = stats.totalIn - stats.totalOut;
+      }
 
       const adminTxRef = db.collection("walletTransactions").doc();
       const userTxRef = db.collection("walletTransactions").doc();
       const notifRef = db.collection("notifications").doc();
 
       // ✅ APRÈS TOUS LES READS : WRITES
-      t.update(userRef,{
-        wallet: newWallet,
-        walletLocked: newLocked,
-        verification:{
-          type:"blue",
-          status:"active",
-          expiresAt
-        }
-      });
+      if (isBuyerAdmin) {
+        // L'Admin s'auto-approuve : On débloque juste l'argent, on ne déduit rien
+        t.update(userRef, {
+          walletLocked: newLocked,
+          verification: {
+            type: "blue",
+            status: "active",
+            expiresAt
+          }
+        });
+      } else {
+        // Utilisateur Normal
+        t.update(userRef, {
+          wallet: newWallet,
+          walletLocked: newLocked,
+          verification: {
+            type: "blue",
+            status: "active",
+            expiresAt
+          }
+        });
 
-      t.update(adminRef,{
-        wallet: newAdminWallet,
-        walletEarned: newAdminEarned
-      });
+        t.update(adminRef, {
+          wallet: newAdminWallet,
+          walletEarned: newAdminEarned
+        });
 
-      t.set(adminTxRef,{
-        userId: ADMIN_UID,
-        type: "blue_payment_received",
-        amount,
-        status: "completed",
-        payerId: paymentData.userId,
-        paymentId,
-        balanceAfter: newAdminWallet,
-        approvedBy: staffUid,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+        t.set(adminTxRef, {
+          userId: ADMIN_UID,
+          type: "blue_payment_received",
+          amount,
+          status: "completed",
+          payerId: paymentData.userId,
+          paymentId,
+          balanceAfter: newAdminWallet,
+          approvedBy: staffUid,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
 
-      t.set(statsRef, stats);
+        t.set(statsRef, stats);
+      }
 
-      t.update(paymentRef,{
-        status:"approved",
+      t.update(paymentRef, {
+        status: "approved",
         approvedAt: admin.firestore.FieldValue.serverTimestamp(),
         approvedBy: staffUid
       });
 
-      t.set(userTxRef,{
+      t.set(userTxRef, {
         userId: paymentData.userId,
         type: "blue_payment_completed",
-        amount,
+        amount: isBuyerAdmin ? 0 : amount, // L'admin ne dépense rien au final
         status: "completed",
         paymentId,
         balanceAfter: newWallet,
@@ -2975,7 +3000,7 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      t.set(notifRef,{
+      t.set(notifRef, {
         to: paymentData.userId,
         from: staffUid,
         type: "blue_approved",
@@ -2984,6 +3009,7 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
         expiresAt: expiresAt,  
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
+      // ================= FIN DES MODIFICATIONS =================
     });
 
     return res.json({success:true});
@@ -2993,6 +3019,7 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
     return res.status(500).json({error:e.message});
   }
 });
+
 
 
 app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{

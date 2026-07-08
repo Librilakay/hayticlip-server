@@ -24,17 +24,15 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const tf = require('@tensorflow/tfjs-node');
 const nsfw = require('nsfwjs');
 
-// 🧠 URL de secours (GitHub officiel) car le serveur par défaut est hors-ligne
-const modelUrl = "https://raw.githubusercontent.com/infinitered/nsfwjs/master/example/nsfw_demo/public/quant_nsfw_mobilenet/";
-
-// Chargement du modèle IA en mémoire au démarrage du serveur
+// 🧠 Chargement du modèle par défaut (désormais intégré localement sans URL)
 let nsfwModel = null;
-nsfw.load(modelUrl).then(model => {
+nsfw.load().then(model => {
   nsfwModel = model;
   console.log("🧠 ✅ Modèle d'IA NSFWJS chargé et prêt pour la modération !");
 }).catch(err => {
   console.error("❌ Erreur de chargement du modèle NSFWJS :", err);
 });
+
 
 const app = express();
 

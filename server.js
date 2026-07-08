@@ -21,7 +21,7 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 
-const tf = require('@tensorflow/tfjs-node');
+const tf = require('@tensorflow/tfjs');
 const nsfw = require('nsfwjs');
 
 // 🧠 Chargement du modèle par défaut (désormais intégré localement sans URL)

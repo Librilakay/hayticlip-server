@@ -3110,9 +3110,10 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 });
 
 
+
 app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
   let outputPath = null;
-  let framePath = null;
+  let framePaths = []; // Pour stocker et nettoyer plusieurs images
 
   try {
     const { videoId, videoUrl, filePath } = req.body;
@@ -3124,58 +3125,93 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     // Libère immédiatement le frontend pour l'utilisateur
     res.json({ success: true, message: "Traitement démarré en arrière-plan" });
 
-    outputPath = `uploads/compressed_${Date.now()}.mp4`;
-    framePath = `uploads/frame_${Date.now()}.jpg`;
+    if (!fs.existsSync('uploads')) {
+      fs.mkdirSync('uploads', { recursive: true });
+    }
 
-    let modStatus = "clean"; // Par défaut, la vidéo est considérée propre
+    outputPath = `uploads/compressed_${Date.now()}.mp4`;
+    let modStatus = "clean"; // Propre par défaut
 
     // =========================================================================
-    // 1️⃣ ANALYSE IA (Sightengine API)
+    // 1️⃣ EXTRACTION IA ET ENVOI À SIGHTENGINE (Analyse multiple)
     // =========================================================================
     try {
-      console.log(`🤖 [1/4] Extraction IA pour ${videoId}...`);
-      
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoUrl)
-          .screenshots({
-            timestamps: ['50%'], 
-            filename: framePath.split('/').pop(),
-            folder: 'uploads/',
-            size: '320x240'
-          })
-          .on("end", resolve)
-          .on("error", reject);
-      });
+      const timestamps = ['25%', '50%', '75%'];
 
-      if (fs.existsSync(framePath)) {
-        const FormData = require('form-data');
-        const data = new FormData();
+      for (let i = 0; i < timestamps.length; i++) {
+        if (modStatus === "flagged") {
+          console.log(`🛑 [IA] Vidéo déjà flaggée, on arrête les tests suivants pour économiser le quota.`);
+          break; 
+        }
+
+        const currentFramePath = `uploads/frame_${Date.now()}_${i}.jpg`;
+        framePaths.push(currentFramePath);
+
+        console.log(`🤖 [1/4] Extraction IA à ${timestamps[i]} pour ${videoId}...`);
         
-        data.append('media', fs.createReadStream(framePath));
-        data.append('models', 'nudity-2.0,wad,gore'); 
-        data.append('api_user', process.env.SIGHTENGINE_USER);
-        data.append('api_secret', process.env.SIGHTENGINE_SECRET);
-
-        const response = await axios({
-          method: 'post',
-          url: 'https://api.sightengine.com/1.0/check.json',
-          data: data,
-          headers: data.getHeaders()
+        await new Promise((resolve, reject) => {
+          ffmpeg(videoUrl)
+            .screenshots({
+              timestamps: [timestamps[i]], 
+              filename: currentFramePath.split('/').pop(),
+              folder: 'uploads/',
+              size: '320x240'
+            })
+            .on("end", resolve)
+            .on("error", reject);
         });
 
-        const result = response.data;
+        if (fs.existsSync(currentFramePath)) {
+          const FormData = require('form-data');
+          const data = new FormData();
+          
+          data.append('media', fs.createReadStream(currentFramePath));
+          data.append('models', 'nudity-2.0,wad,gore'); 
+          data.append('api_user', process.env.SIGHTENGINE_USER);
+          data.append('api_secret', process.env.SIGHTENGINE_SECRET);
 
-        // Si le contenu est douteux, on le flag
-        if (result.nudity && result.nudity.safe < 0.5) modStatus = "flagged";
-        if (result.gore && result.gore.prob > 0.5) modStatus = "flagged";
-        if (result.wad && (result.wad.weapons > 0.5 || result.wad.drugs > 0.5)) modStatus = "flagged";
-        
-        console.log(`🤖 Résultat IA : ${modStatus}`);
+          const response = await axios({
+            method: 'post',
+            url: 'https://api.sightengine.com/1.0/check.json',
+            data: data,
+            headers: data.getHeaders()
+          });
+
+          const result = response.data;
+          
+          if (result.status === "success") {
+            // Afficher uniquement la partie nudité dans les logs pour ne pas polluer Render
+            console.log(`🔍 [DEBUG IA ${timestamps[i]}] Nudité détectée :`, JSON.stringify(result.nudity || "Non pertinent", null, 2));
+
+            if (result.nudity) {
+              if (
+                result.nudity.sexual_activity > 0.5 || 
+                result.nudity.sexual_display > 0.5 || 
+                result.nudity.erotica > 0.5 ||
+                result.nudity.very_suggestive > 0.6 
+              ) {
+                modStatus = "flagged";
+              }
+            }
+
+            if (result.gore && result.gore.prob > 0.5) modStatus = "flagged";
+            if (result.wad && (result.wad.weapons > 0.5 || result.wad.drugs > 0.5)) modStatus = "flagged";
+          }
+          
+          // Suppression immédiate de l'image analysée
+          fs.unlinkSync(currentFramePath);
+        }
       }
+      
+      console.log(`🤖 Résultat IA Final : ${modStatus}`);
+
     } catch (apiError) {
-      console.error("⚠️ Erreur API Sightengine (laissée clean par défaut) :", apiError.message);
+      console.error("⚠️ Erreur API Sightengine (ignorée pour ne pas bloquer) :", apiError.response?.data || apiError.message);
     } finally {
-      if (fs.existsSync(framePath)) fs.unlinkSync(framePath); // Toujours vider la RAM/Stockage
+      // Sécurité : nettoyer toutes les images restantes en cas de crash
+      framePaths.forEach(path => {
+        if (fs.existsSync(path)) fs.unlinkSync(path);
+      });
     }
 
     // =========================================================================
@@ -3184,7 +3220,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     let compressionSuccess = false;
 
     try {
-      console.log(`⚡ [2/4] Compression obligatoire pour ${videoId}...`);
+      console.log(`⚡ [2/4] Compression pour ${videoId}...`);
       await new Promise((resolve, reject) => {
         ffmpeg(videoUrl)
           .outputOptions([
@@ -3219,7 +3255,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         .from("media")
         .upload(filePath, fileBuffer, {
           contentType: "video/mp4",
-          upsert: true // Écrase le fichier brut pour ne pas gaspiller de place
+          upsert: true 
         });
 
       if (uploadError) {
@@ -3230,26 +3266,26 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
 
     // =========================================================================
-    // 4️⃣, 5️⃣, 6️⃣ MISE À JOUR FIRESTORE (Logique Feed & Admin)
+    // 4️⃣ MISE À JOUR FIRESTORE
     // =========================================================================
     console.log(`🔥 [4/4] Mise à jour Firestore (Statut: ${modStatus})`);
     
     await db.collection("videos").doc(videoId).update({
       moderationStatus: modStatus 
     });
-    // Si modStatus == "flagged", elle n'apparaîtra pas dans le feed public.
-    // L'administrateur pourra la retrouver dans l'espace Admin pour statuer.
 
-    // Nettoyage final du fichier local
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     console.log(`🎉 PROCESSUS TERMINÉ AVEC SUCCÈS POUR ${videoId}`);
 
   } catch (e) {
     console.error("❌ ERREUR FATALE OPTIMIZE-VIDEO :", e.message);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath);
+    framePaths.forEach(path => {
+      if (fs.existsSync(path)) fs.unlinkSync(path);
+    });
   }
 });
+
 
 
 // ================= ADMIN FINANCE SUMMARY =================

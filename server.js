@@ -3122,48 +3122,49 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 
 
 
-app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.single("video"), async (req, res) => {
-  let inputPath = null;
+app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
   let outputPath = null;
   let framePath = null;
 
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "Aucune vidéo reçue" });
+    const { videoId, videoUrl, filePath } = req.body;
+
+    if (!videoId || !videoUrl || !filePath) {
+      return res.status(400).json({ error: "Données manquantes" });
     }
 
-    inputPath = req.file.path;
+    // Le serveur renvoie immédiatement 'OK' au front pour ne pas faire bugger la connexion,
+    // mais il continue à travailler en tâche de fond !
+    res.json({ success: true, message: "Traitement démarré en arrière-plan" });
+
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
     framePath = `uploads/frame_${Date.now()}.jpg`;
 
-    let modStatus = "clean"; 
+    let modStatus = "clean"; // Par défaut
 
     // =========================================================================
-    // 🧠 1️⃣ IA MODÉRATION : Extraction d'une image et analyse locale (NSFWJS)
+    // 🧠 ÉTAPE 1 : IA MODÉRATION (Seule en mémoire)
     // =========================================================================
     try {
-      console.log("🤖 [IA] Extraction d'une image pour analyse...");
+      console.log(`🤖 [IA] Extraction d'une image pour la vidéo ${videoId}...`);
       
       await new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
+        ffmpeg(videoUrl)
           .screenshots({
             timestamps: ['50%'], 
             filename: framePath.split('/').pop(),
             folder: 'uploads/',
-            size: '320x240' // Toute petite taille pour économiser la RAM
+            size: '320x240'
           })
           .on("end", resolve)
           .on("error", reject);
       });
-
-      console.log("🤖 [IA] Analyse locale de l'image par NSFWJS...");
 
       if (nsfwModel && fs.existsSync(framePath)) {
         let image;
         try {
           const imageBuffer = fs.readFileSync(framePath);
           image = await tf.node.decodeImage(imageBuffer, 3);
-          
           const predictions = await nsfwModel.classify(image);
           
           predictions.forEach(p => {
@@ -3171,65 +3172,93 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
               modStatus = "flagged";
             }
           });
-
-          if (modStatus === "flagged") {
-            console.log("🚫 [IA] Contenu inapproprié détecté !");
-          } else {
-            console.log("✅ [IA] Vidéo propre.");
-          }
+          console.log(`🤖 [IA] Résultat de l'analyse : ${modStatus}`);
         } finally {
-          // ⚠️ SÉCURITÉ MÉMOIRE : Forcer la destruction de l'image dans la RAM quoi qu'il arrive
+          // ⚠️ LIBÉRATION IMMÉDIATE DE LA RAM
           if (image) image.dispose();
         }
       }
-
     } catch (aiError) {
-      console.error("⚠️ [IA] Erreur d'analyse (la vidéo passe en clean) :", aiError.message);
+      console.error("⚠️ [IA] Erreur d'analyse :", aiError.message);
     } finally {
+      // Nettoyage de l'image extraite
       if (fs.existsSync(framePath)) fs.unlinkSync(framePath);
     }
+
+
     // =========================================================================
+    // ⚡ ÉTAPE 2 : COMPRESSION (L'IA n'est plus en RAM)
+    // =========================================================================
+    let compressionSuccess = false;
 
-    // 2️⃣ COMPRESSION VIDÉO EXTRÊME (OPTIMISÉE POUR FAIBLE RAM)
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .outputOptions([
-          "-vf scale='min(480,iw)':-2",
-          "-r 24",
-          "-c:v libx264",
-          "-preset ultrafast",
-          "-crf 30",
-          "-threads 1", // ⚠️ LE CHANGEMENT EST ICI : On force 1 seul cœur CPU pour ne pas faire exploser la RAM
-          "-c:a aac",
-          "-b:a 64k",
-          "-movflags +faststart",
-          "-max_muxing_queue_size 1024"
-        ])
-        .save(outputPath)
-        .on("end", resolve)
-        .on("error", (err) => {
-          console.error("FFMPEG FATAL ERROR:", err);
-          reject(err);
+    try {
+      console.log(`⚡ [FFMPEG] Début de la compression pour ${videoId}...`);
+      await new Promise((resolve, reject) => {
+        ffmpeg(videoUrl)
+          .outputOptions([
+            "-vf scale='min(480,iw)':-2",
+            "-r 24",
+            "-c:v libx264",
+            "-preset ultrafast",
+            "-crf 30",
+            "-threads 1", // 1 cœur maximum pour sauver la RAM !
+            "-c:a aac",
+            "-b:a 64k",
+            "-movflags +faststart"
+          ])
+          .save(outputPath)
+          .on("end", resolve)
+          .on("error", reject);
+      });
+      compressionSuccess = true;
+      console.log(`✅ [FFMPEG] Compression réussie pour ${videoId}`);
+    } catch (compError) {
+      console.error(`❌ [FFMPEG] Échec de la compression pour ${videoId} :`, compError.message);
+      // On ne plante pas ! On laisse la vidéo originale intacte sur Supabase.
+    }
+
+
+    // =========================================================================
+    // ☁️ ÉTAPE 3 : REMPLACEMENT DANS SUPABASE (Seulement si l'étape 2 a marché)
+    // =========================================================================
+    if (compressionSuccess && fs.existsSync(outputPath)) {
+      console.log(`☁️ [SUPABASE] Écrasement de la vidéo brute par la version compressée...`);
+      const fileBuffer = fs.readFileSync(outputPath);
+      
+      const { error: uploadError } = await supabase.storage
+        .from("media")
+        .upload(filePath, fileBuffer, {
+          contentType: "video/mp4",
+          upsert: true // Écrase l'ancienne vidéo brute avec la compressée
         });
+
+      if (uploadError) {
+        console.error("❌ [SUPABASE] Erreur lors de l'écrasement :", uploadError.message);
+      } else {
+        console.log("☁️ ✅ [SUPABASE] Vidéo remplacée avec succès !");
+      }
+    } else {
+      console.log("⚠️ [SUPABASE] Compression échouée, la vidéo ORIGINALE est conservée.");
+    }
+
+
+    // =========================================================================
+    // 🔥 ÉTAPE 4 : MISE À JOUR FIRESTORE (Affichage public de la vidéo)
+    // =========================================================================
+    console.log(`🔥 [FIRESTORE] Mise à jour du statut sur : ${modStatus}`);
+    await db.collection("videos").doc(videoId).update({
+      moderationStatus: modStatus // Remplace le "pending_ia"
     });
 
-    // 3️⃣ RENVOI AU FRONTEND AVEC LE STATUT IA DANS LES HEADERS
-    res.set('Access-Control-Expose-Headers', 'X-Moderation-Status'); 
-    res.set('X-Moderation-Status', modStatus);
 
-    res.download(outputPath, "hayticlips_compressed.mp4", () => {
-      if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    });
+    // Nettoyage final du fichier compressé local
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    console.log(`🎉 PROCESSUS TERMINÉ POUR ${videoId}`);
 
   } catch (e) {
-    console.log("COMPRESS VIDEO ERROR:", e);
-
-    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    console.error("❌ ERREUR GLOBALE OPTIMIZE :", e.message);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath);
-
-    res.status(500).json({ error: "Compression impossible ou délai dépassé." });
   }
 });
 

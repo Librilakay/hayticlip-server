@@ -19,6 +19,18 @@ const fs = require("fs");
  const ffmpeg = require("fluent-ffmpeg");
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const tf = require('@tensorflow/tfjs-node');
+const nsfw = require('nsfwjs');
+
+// 🧠 Chargement du modèle IA en mémoire au démarrage du serveur
+let nsfwModel = null;
+nsfw.load().then(model => {
+  nsfwModel = model;
+  console.log("🧠 ✅ Modèle d'IA NSFWJS chargé et prêt pour la modération !");
+}).catch(err => {
+  console.error("❌ Erreur de chargement du modèle NSFWJS :", err);
+});
+
 
 const app = express();
 
@@ -3107,9 +3119,11 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 });
 
 
+
 app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.single("video"), async (req, res) => {
   let inputPath = null;
   let outputPath = null;
+  let framePath = null; // Ajout du chemin pour l'image extraite
 
   try {
     if (!req.file) {
@@ -3118,21 +3132,79 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
 
     inputPath = req.file.path;
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
+    framePath = `uploads/frame_${Date.now()}.jpg`;
 
-    // ⚡ OPTIMISATION EXTRÊME FFMPEG POUR LA VITESSE
+    let modStatus = "clean"; // Par défaut, la vidéo est considérée propre
+
+    // =========================================================================
+    // 🧠 1️⃣ IA MODÉRATION : Extraction d'une image et analyse locale (NSFWJS)
+    // =========================================================================
+    try {
+      console.log("🤖 [IA] Extraction d'une image pour analyse...");
+      
+      await new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+          .screenshots({
+            timestamps: ['50%'], 
+            filename: framePath.split('/').pop(),
+            folder: 'uploads/',
+            size: '320x240' // Résolution basse = analyse très rapide
+          })
+          .on("end", resolve)
+          .on("error", reject);
+      });
+
+      console.log("🤖 [IA] Analyse locale de l'image par NSFWJS...");
+
+      if (nsfwModel && fs.existsSync(framePath)) {
+        
+        const imageBuffer = fs.readFileSync(framePath);
+        const image = await tf.node.decodeImage(imageBuffer, 3);
+        
+        const predictions = await nsfwModel.classify(image);
+        
+        // ⚠️ CRUCIAL : Libérer la mémoire RAM immédiatement
+        image.dispose(); 
+
+        predictions.forEach(p => {
+          // Détection de nudité/contenu suggestif > 60%
+          if ((p.className === 'Porn' || p.className === 'Hentai' || p.className === 'Sexy') && p.probability > 0.6) {
+            modStatus = "flagged";
+          }
+        });
+
+        if (modStatus === "flagged") {
+          console.log("🚫 [IA] Contenu inapproprié détecté, mise en quarantaine ! Détails :", predictions);
+        } else {
+          console.log("✅ [IA] Vidéo propre.");
+        }
+
+      } else {
+        console.log("⚠️ [IA] Modèle non prêt, la vidéo passe en clean par sécurité.");
+      }
+
+    } catch (aiError) {
+      console.error("⚠️ [IA] Erreur d'analyse (la vidéo passe en clean) :", aiError.message);
+    } finally {
+      // Nettoyage immédiat de l'image extraite
+      if (fs.existsSync(framePath)) fs.unlinkSync(framePath);
+    }
+    // =========================================================================
+
+    // 2️⃣ COMPRESSION VIDÉO EXTRÊME
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
-          "-vf scale='min(480,iw)':-2", // 480p max (très rapide, qualité largement suffisante pour mobile)
-          "-r 24",                      // Limiter à 24 images/sec (réduit le temps de calcul de 20%)
-          "-c:v libx264",               // Codec standard
-          "-preset ultrafast",          // Vitesse absolue au détriment d'une très légère perte de compression
-          "-crf 30",                    // Niveau de compression plus élevé
-          "-threads 0",                 // Utiliser 100% des cœurs du processeur disponibles
+          "-vf scale='min(480,iw)':-2",
+          "-r 24",
+          "-c:v libx264",
+          "-preset ultrafast",
+          "-crf 30",
+          "-threads 0",
           "-c:a aac",
-          "-b:a 64k",                   // Audio allégé
-          "-movflags +faststart",       // Permet à la vidéo de se lancer sans avoir fini de charger
-          "-max_muxing_queue_size 1024" // Évite les crashs mémoires sur les longues vidéos
+          "-b:a 64k",
+          "-movflags +faststart",
+          "-max_muxing_queue_size 1024"
         ])
         .save(outputPath)
         .on("end", resolve)
@@ -3141,6 +3213,10 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
           reject(err);
         });
     });
+
+    // 3️⃣ RENVOI AU FRONTEND AVEC LE STATUT IA DANS LES HEADERS
+    res.set('Access-Control-Expose-Headers', 'X-Moderation-Status'); 
+    res.set('X-Moderation-Status', modStatus);
 
     res.download(outputPath, "hayticlips_compressed.mp4", () => {
       if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
@@ -3152,6 +3228,7 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
 
     if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath); // Nettoyage de sécurité
 
     res.status(500).json({ error: "Compression impossible ou délai dépassé." });
   }

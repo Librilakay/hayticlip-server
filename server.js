@@ -3125,7 +3125,7 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.single("video"), async (req, res) => {
   let inputPath = null;
   let outputPath = null;
-  let framePath = null; // Ajout du chemin pour l'image extraite
+  let framePath = null;
 
   try {
     if (!req.file) {
@@ -3136,7 +3136,7 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
     framePath = `uploads/frame_${Date.now()}.jpg`;
 
-    let modStatus = "clean"; // Par défaut, la vidéo est considérée propre
+    let modStatus = "clean"; 
 
     // =========================================================================
     // 🧠 1️⃣ IA MODÉRATION : Extraction d'une image et analyse locale (NSFWJS)
@@ -3150,7 +3150,7 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
             timestamps: ['50%'], 
             filename: framePath.split('/').pop(),
             folder: 'uploads/',
-            size: '320x240' // Résolution basse = analyse très rapide
+            size: '320x240' // Toute petite taille pour économiser la RAM
           })
           .on("end", resolve)
           .on("error", reject);
@@ -3159,41 +3159,38 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
       console.log("🤖 [IA] Analyse locale de l'image par NSFWJS...");
 
       if (nsfwModel && fs.existsSync(framePath)) {
-        
-        const imageBuffer = fs.readFileSync(framePath);
-        const image = await tf.node.decodeImage(imageBuffer, 3);
-        
-        const predictions = await nsfwModel.classify(image);
-        
-        // ⚠️ CRUCIAL : Libérer la mémoire RAM immédiatement
-        image.dispose(); 
+        let image;
+        try {
+          const imageBuffer = fs.readFileSync(framePath);
+          image = await tf.node.decodeImage(imageBuffer, 3);
+          
+          const predictions = await nsfwModel.classify(image);
+          
+          predictions.forEach(p => {
+            if ((p.className === 'Porn' || p.className === 'Hentai' || p.className === 'Sexy') && p.probability > 0.6) {
+              modStatus = "flagged";
+            }
+          });
 
-        predictions.forEach(p => {
-          // Détection de nudité/contenu suggestif > 60%
-          if ((p.className === 'Porn' || p.className === 'Hentai' || p.className === 'Sexy') && p.probability > 0.6) {
-            modStatus = "flagged";
+          if (modStatus === "flagged") {
+            console.log("🚫 [IA] Contenu inapproprié détecté !");
+          } else {
+            console.log("✅ [IA] Vidéo propre.");
           }
-        });
-
-        if (modStatus === "flagged") {
-          console.log("🚫 [IA] Contenu inapproprié détecté, mise en quarantaine ! Détails :", predictions);
-        } else {
-          console.log("✅ [IA] Vidéo propre.");
+        } finally {
+          // ⚠️ SÉCURITÉ MÉMOIRE : Forcer la destruction de l'image dans la RAM quoi qu'il arrive
+          if (image) image.dispose();
         }
-
-      } else {
-        console.log("⚠️ [IA] Modèle non prêt, la vidéo passe en clean par sécurité.");
       }
 
     } catch (aiError) {
       console.error("⚠️ [IA] Erreur d'analyse (la vidéo passe en clean) :", aiError.message);
     } finally {
-      // Nettoyage immédiat de l'image extraite
       if (fs.existsSync(framePath)) fs.unlinkSync(framePath);
     }
     // =========================================================================
 
-    // 2️⃣ COMPRESSION VIDÉO EXTRÊME
+    // 2️⃣ COMPRESSION VIDÉO EXTRÊME (OPTIMISÉE POUR FAIBLE RAM)
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
@@ -3202,7 +3199,7 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
           "-c:v libx264",
           "-preset ultrafast",
           "-crf 30",
-          "-threads 0",
+          "-threads 1", // ⚠️ LE CHANGEMENT EST ICI : On force 1 seul cœur CPU pour ne pas faire exploser la RAM
           "-c:a aac",
           "-b:a 64k",
           "-movflags +faststart",
@@ -3230,11 +3227,12 @@ app.post("/api/compress-video", compressLimiter, verifyFirebaseToken, upload.sin
 
     if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath); // Nettoyage de sécurité
+    if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath);
 
     res.status(500).json({ error: "Compression impossible ou délai dépassé." });
   }
 });
+
 
 
 // ================= ADMIN FINANCE SUMMARY =================

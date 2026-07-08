@@ -21,17 +21,6 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 
-const tf = require('@tensorflow/tfjs');
-const nsfw = require('nsfwjs');
-
-// 🧠 Chargement du modèle par défaut (désormais intégré localement sans URL)
-let nsfwModel = null;
-nsfw.load().then(model => {
-  nsfwModel = model;
-  console.log("🧠 ✅ Modèle d'IA NSFWJS chargé et prêt pour la modération !");
-}).catch(err => {
-  console.error("❌ Erreur de chargement du modèle NSFWJS :", err);
-});
 
 
 const app = express();
@@ -3121,7 +3110,6 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 });
 
 
-
 app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
   let outputPath = null;
   let framePath = null;
@@ -3133,20 +3121,19 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ error: "Données manquantes" });
     }
 
-    // Le serveur renvoie immédiatement 'OK' au front pour ne pas faire bugger la connexion,
-    // mais il continue à travailler en tâche de fond !
+    // Libère immédiatement le frontend pour l'utilisateur
     res.json({ success: true, message: "Traitement démarré en arrière-plan" });
 
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
     framePath = `uploads/frame_${Date.now()}.jpg`;
 
-    let modStatus = "clean"; // Par défaut
+    let modStatus = "clean"; // Par défaut, la vidéo est considérée propre
 
     // =========================================================================
-    // 🧠 ÉTAPE 1 : IA MODÉRATION (Seule en mémoire)
+    // 1️⃣ ANALYSE IA (Sightengine API)
     // =========================================================================
     try {
-      console.log(`🤖 [IA] Extraction d'une image pour la vidéo ${videoId}...`);
+      console.log(`🤖 [1/4] Extraction IA pour ${videoId}...`);
       
       await new Promise((resolve, reject) => {
         ffmpeg(videoUrl)
@@ -3160,39 +3147,44 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           .on("error", reject);
       });
 
-      if (nsfwModel && fs.existsSync(framePath)) {
-        let image;
-        try {
-          const imageBuffer = fs.readFileSync(framePath);
-          image = await tf.node.decodeImage(imageBuffer, 3);
-          const predictions = await nsfwModel.classify(image);
-          
-          predictions.forEach(p => {
-            if ((p.className === 'Porn' || p.className === 'Hentai' || p.className === 'Sexy') && p.probability > 0.6) {
-              modStatus = "flagged";
-            }
-          });
-          console.log(`🤖 [IA] Résultat de l'analyse : ${modStatus}`);
-        } finally {
-          // ⚠️ LIBÉRATION IMMÉDIATE DE LA RAM
-          if (image) image.dispose();
-        }
+      if (fs.existsSync(framePath)) {
+        const FormData = require('form-data');
+        const data = new FormData();
+        
+        data.append('media', fs.createReadStream(framePath));
+        data.append('models', 'nudity-2.0,wad,gore'); 
+        data.append('api_user', process.env.SIGHTENGINE_USER);
+        data.append('api_secret', process.env.SIGHTENGINE_SECRET);
+
+        const response = await axios({
+          method: 'post',
+          url: 'https://api.sightengine.com/1.0/check.json',
+          data: data,
+          headers: data.getHeaders()
+        });
+
+        const result = response.data;
+
+        // Si le contenu est douteux, on le flag
+        if (result.nudity && result.nudity.safe < 0.5) modStatus = "flagged";
+        if (result.gore && result.gore.prob > 0.5) modStatus = "flagged";
+        if (result.wad && (result.wad.weapons > 0.5 || result.wad.drugs > 0.5)) modStatus = "flagged";
+        
+        console.log(`🤖 Résultat IA : ${modStatus}`);
       }
-    } catch (aiError) {
-      console.error("⚠️ [IA] Erreur d'analyse :", aiError.message);
+    } catch (apiError) {
+      console.error("⚠️ Erreur API Sightengine (laissée clean par défaut) :", apiError.message);
     } finally {
-      // Nettoyage de l'image extraite
-      if (fs.existsSync(framePath)) fs.unlinkSync(framePath);
+      if (fs.existsSync(framePath)) fs.unlinkSync(framePath); // Toujours vider la RAM/Stockage
     }
 
-
     // =========================================================================
-    // ⚡ ÉTAPE 2 : COMPRESSION (L'IA n'est plus en RAM)
+    // 2️⃣ COMPRESSION OBLIGATOIRE (Même si "flagged")
     // =========================================================================
     let compressionSuccess = false;
 
     try {
-      console.log(`⚡ [FFMPEG] Début de la compression pour ${videoId}...`);
+      console.log(`⚡ [2/4] Compression obligatoire pour ${videoId}...`);
       await new Promise((resolve, reject) => {
         ffmpeg(videoUrl)
           .outputOptions([
@@ -3201,7 +3193,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
             "-c:v libx264",
             "-preset ultrafast",
             "-crf 30",
-            "-threads 1", // 1 cœur maximum pour sauver la RAM !
+            "-threads 1", // Protège la mémoire du serveur Render
             "-c:a aac",
             "-b:a 64k",
             "-movflags +faststart"
@@ -3211,57 +3203,53 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           .on("error", reject);
       });
       compressionSuccess = true;
-      console.log(`✅ [FFMPEG] Compression réussie pour ${videoId}`);
+      console.log(`⚡ Compression réussie !`);
     } catch (compError) {
-      console.error(`❌ [FFMPEG] Échec de la compression pour ${videoId} :`, compError.message);
-      // On ne plante pas ! On laisse la vidéo originale intacte sur Supabase.
+      console.error(`❌ Échec de la compression :`, compError.message);
     }
 
-
     // =========================================================================
-    // ☁️ ÉTAPE 3 : REMPLACEMENT DANS SUPABASE (Seulement si l'étape 2 a marché)
+    // 3️⃣ REMPLACEMENT DANS SUPABASE
     // =========================================================================
     if (compressionSuccess && fs.existsSync(outputPath)) {
-      console.log(`☁️ [SUPABASE] Écrasement de la vidéo brute par la version compressée...`);
+      console.log(`☁️ [3/4] Remplacement sur Supabase...`);
       const fileBuffer = fs.readFileSync(outputPath);
-      
+
       const { error: uploadError } = await supabase.storage
         .from("media")
         .upload(filePath, fileBuffer, {
           contentType: "video/mp4",
-          upsert: true // Écrase l'ancienne vidéo brute avec la compressée
+          upsert: true // Écrase le fichier brut pour ne pas gaspiller de place
         });
 
       if (uploadError) {
-        console.error("❌ [SUPABASE] Erreur lors de l'écrasement :", uploadError.message);
+        console.error("❌ Erreur Supabase :", uploadError.message);
       } else {
-        console.log("☁️ ✅ [SUPABASE] Vidéo remplacée avec succès !");
+        console.log("☁️ Vidéo optimisée sauvegardée sur le cloud.");
       }
-    } else {
-      console.log("⚠️ [SUPABASE] Compression échouée, la vidéo ORIGINALE est conservée.");
     }
 
-
     // =========================================================================
-    // 🔥 ÉTAPE 4 : MISE À JOUR FIRESTORE (Affichage public de la vidéo)
+    // 4️⃣, 5️⃣, 6️⃣ MISE À JOUR FIRESTORE (Logique Feed & Admin)
     // =========================================================================
-    console.log(`🔥 [FIRESTORE] Mise à jour du statut sur : ${modStatus}`);
+    console.log(`🔥 [4/4] Mise à jour Firestore (Statut: ${modStatus})`);
+    
     await db.collection("videos").doc(videoId).update({
-      moderationStatus: modStatus // Remplace le "pending_ia"
+      moderationStatus: modStatus 
     });
+    // Si modStatus == "flagged", elle n'apparaîtra pas dans le feed public.
+    // L'administrateur pourra la retrouver dans l'espace Admin pour statuer.
 
-
-    // Nettoyage final du fichier compressé local
+    // Nettoyage final du fichier local
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    console.log(`🎉 PROCESSUS TERMINÉ POUR ${videoId}`);
+    console.log(`🎉 PROCESSUS TERMINÉ AVEC SUCCÈS POUR ${videoId}`);
 
   } catch (e) {
-    console.error("❌ ERREUR GLOBALE OPTIMIZE :", e.message);
+    console.error("❌ ERREUR FATALE OPTIMIZE-VIDEO :", e.message);
     if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath);
   }
 });
-
 
 
 // ================= ADMIN FINANCE SUMMARY =================

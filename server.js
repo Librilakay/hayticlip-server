@@ -3113,7 +3113,7 @@ app.post("/api/blue/reject-payment", verifyFirebaseToken, async (req,res)=>{
 
 app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
   let outputPath = null;
-  let framePaths = []; // Pour stocker et nettoyer plusieurs images
+  let framePaths = [];
 
   try {
     const { videoId, videoUrl, filePath } = req.body;
@@ -3122,7 +3122,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ error: "Données manquantes" });
     }
 
-    // Libère immédiatement le frontend pour l'utilisateur
     res.json({ success: true, message: "Traitement démarré en arrière-plan" });
 
     if (!fs.existsSync('uploads')) {
@@ -3130,15 +3129,17 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
 
     outputPath = `uploads/compressed_${Date.now()}.mp4`;
-    let modStatus = "clean"; // Propre par défaut
+    let modStatus = "clean";
 
     // =========================================================================
-    // 1️⃣ EXTRACTION IA ET ENVOI À SIGHTENGINE (Analyse multiple)
+    // 1️⃣ EXTRACTION IA ET ENVOI À SIGHTENGINE (Analyse multiple + TikTok check)
     // =========================================================================
     try {
       const timestamps = ['25%', '50%', '75%'];
 
       for (let i = 0; i < timestamps.length; i++) {
+        const isMiddleFrame = (timestamps[i] === '50%');
+
         if (modStatus === "flagged") {
           console.log(`🛑 [IA] Vidéo déjà flaggée, on arrête les tests suivants pour économiser le quota.`);
           break; 
@@ -3166,7 +3167,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           const data = new FormData();
           
           data.append('media', fs.createReadStream(currentFramePath));
-          data.append('models', 'nudity-2.0,wad,gore'); 
+          data.append('models', 'nudity-2.0,wad,gore,text-detection'); 
           data.append('api_user', process.env.SIGHTENGINE_USER);
           data.append('api_secret', process.env.SIGHTENGINE_SECRET);
 
@@ -3180,9 +3181,17 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           const result = response.data;
           
           if (result.status === "success") {
-            // Afficher uniquement la partie nudité dans les logs pour ne pas polluer Render
-            console.log(`🔍 [DEBUG IA ${timestamps[i]}] Nudité détectée :`, JSON.stringify(result.nudity || "Non pertinent", null, 2));
+            // --- 📌 VÉRIFICATION DU MOT "TIKTOK" SUR LA FRAME DU MILIEU (50%) ---
+            if (isMiddleFrame) {
+              const fullResponseText = JSON.stringify(result).toLowerCase();
+              
+              if (fullResponseText.includes("tiktok")) {
+                console.log(`⚠️ [IA] Mot 'tiktok' détecté dans la frame du milieu (${timestamps[i]}) !`);
+                modStatus = "pending_ia";
+              }
+            }
 
+            // --- 🔞 VÉRIFICATION DE LA NUDITÉ ET CONTENUS SENSIBLES ---
             if (result.nudity) {
               if (
                 result.nudity.sexual_activity > 0.5 || 
@@ -3198,7 +3207,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
             if (result.wad && (result.wad.weapons > 0.5 || result.wad.drugs > 0.5)) modStatus = "flagged";
           }
           
-          // Suppression immédiate de l'image analysée
           fs.unlinkSync(currentFramePath);
         }
       }
@@ -3208,14 +3216,13 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     } catch (apiError) {
       console.error("⚠️ Erreur API Sightengine (ignorée pour ne pas bloquer) :", apiError.response?.data || apiError.message);
     } finally {
-      // Sécurité : nettoyer toutes les images restantes en cas de crash
       framePaths.forEach(path => {
         if (fs.existsSync(path)) fs.unlinkSync(path);
       });
     }
 
     // =========================================================================
-    // 2️⃣ COMPRESSION OBLIGATOIRE (Même si "flagged")
+    // 2️⃣ COMPRESSION OBLIGATOIRE
     // =========================================================================
     let compressionSuccess = false;
 
@@ -3229,7 +3236,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
             "-c:v libx264",
             "-preset ultrafast",
             "-crf 30",
-            "-threads 1", // Protège la mémoire du serveur Render
+            "-threads 1",
             "-c:a aac",
             "-b:a 64k",
             "-movflags +faststart"
@@ -3285,7 +3292,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     });
   }
 });
-
 
 
 // ================= ADMIN FINANCE SUMMARY =================

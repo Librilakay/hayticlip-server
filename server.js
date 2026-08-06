@@ -20,10 +20,37 @@ const fs = require("fs");
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-
-
-
 const app = express();
+
+
+
+// ================= MOTEUR DE NOTIFICATIONS PUSH =================
+async function sendPushNotification(targetUid, title, body, extraData = {}) {
+  try {
+    const userDoc = await admin.firestore().collection("users").doc(targetUid).get();
+    if (!userDoc.exists) return;
+
+    const token = userDoc.data()?.fcmToken;
+    if (!token) {
+      console.log(`Pas de token FCM pour l'utilisateur ${targetUid}`);
+      return;
+    }
+
+    const message = {
+      token: token,
+      notification: { title: title, body: body },
+      data: extraData
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log("Notification Push envoyée :", response);
+  } catch (error) {
+    console.error("Erreur envoi notification Push :", error);
+  }
+}
+// ================================================================
+
+
 
 app.set('trust proxy', 1);
 
@@ -345,6 +372,29 @@ async function moncashPrefundedTransactionStatus(reference) {
   return response.data;
 }
 
+
+
+// ROUTE RELAIS POUR LES PUSHS DEPUIS LE FRONTEND
+app.post("/api/send-push", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { targetUid, title, body, extraData } = req.body;
+
+    if (!targetUid || !title || !body) {
+      return res.status(400).json({ error: "Données manquantes pour le push" });
+    }
+
+    // On utilise la fonction sendPushNotification globale que tu as déjà créée sur le serveur
+    await sendPushNotification(targetUid, title, body, extraData);
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("ERREUR ROUTE SEND-PUSH:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+
 // ROUTE ENVOI CADEAU
 app.post("/api/sendGift", giftLimiter, verifyFirebaseToken, async (req,res)=>{
 
@@ -633,6 +683,21 @@ await db.runTransaction(async t=>{
 });
 
 
+// --- DÉBUT DU DÉCLENCHEUR PUSH CADEAU ---
+    const senderSnap = await senderRef.get();
+    const senderUsername = senderSnap.data()?.username || "Un utilisateur";
+
+    await sendPushNotification(
+      creatorId, // ID de la personne qui reçoit le cadeau
+      "Nouveau Cadeau ! 🎁",
+      `${senderUsername} vous a envoyé un cadeau d'une valeur de ${giftAmount} !`,
+      { type: "gift", amount: String(giftAmount) }
+    );
+    // --- FIN DU DÉCLENCHEUR PUSH CADEAU ---
+
+
+
+
 res.json({ success: true });
 
 }catch(e){
@@ -656,6 +721,33 @@ function getLocalDateString(date = new Date()) {
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
+
+
+
+
+// ROUTE POUR SAUVEGARDER LE TOKEN DU TÉLÉPHONE
+app.post("/api/save-fcm-token", verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { fcmToken } = req.body;
+
+    if (!fcmToken || typeof fcmToken !== "string") {
+      return res.status(400).json({ error: "Token FCM invalide ou manquant" });
+    }
+
+    await db.collection("users").doc(uid).update({
+      fcmToken: fcmToken,
+      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Erreur sauvegarde token :", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 
 /* ================= WALLET WITHDRAW ================= */
 

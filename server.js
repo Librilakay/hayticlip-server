@@ -397,321 +397,290 @@ app.post("/api/send-push", verifyFirebaseToken, async (req, res) => {
 
 // ROUTE ENVOI CADEAU
 app.post("/api/sendGift", giftLimiter, verifyFirebaseToken, async (req,res)=>{
+  try {
+    const {videoId, amount} = req.body;
+    const giftAmount = Number(amount);
 
-try{
+    if(!Number.isInteger(giftAmount)){
+      return res.status(400).json({error:"invalid amount"});
+    }
 
-const {videoId, amount} = req.body;
+    const fromUser = req.user.uid;
 
-const giftAmount = Number(amount);
+    if(!videoId || !giftAmount){
+      return res.status(400).json({error:"missing data"});
+    }
 
-if(!Number.isInteger(giftAmount)){
-return res.status(400).json({error:"invalid amount"});
-}
+    const gift = calculateGift(giftAmount);
 
-const fromUser = req.user.uid;
+    if(!gift){
+      return res.status(400).json({error:"invalid amount"});
+    }
 
+    // VIDEO
+    const videoRef = db.collection("videos").doc(videoId);
+    const videoSnap = await videoRef.get();
 
-if(!videoId || !giftAmount){
-return res.status(400).json({error:"missing data"});
-}
+    if(!videoSnap.exists){
+      return res.status(404).json({error:"video not found"});
+    }
 
-const gift = calculateGift(giftAmount);
+    const videoData = videoSnap.data();
 
-if(!gift){
-return res.status(400).json({error:"invalid amount"});
-}
+    if(videoData.archived === true){
+      return res.status(400).json({error:"video archived"});
+    }
 
-// VIDEO
-const videoRef = db.collection("videos").doc(videoId);
-const videoSnap = await videoRef.get();
+    const creatorId = videoData.userId;
 
-if(!videoSnap.exists){
-return res.status(404).json({error:"video not found"});
-}
+    if(!creatorId){
+      return res.status(400).json({error:"invalid creator"});
+    }
 
-const videoData = videoSnap.data();
+    if(fromUser === creatorId){
+      return res.status(400).json({error:"can not send gift to yourself"});
+    }
 
-if(videoData.archived === true){
-return res.status(400).json({error:"video archived"});
-}
+    // USERS
+    const senderRef = db.collection("users").doc(fromUser);
+    const creatorRef = db.collection("users").doc(creatorId);
+    const adminRef = db.collection("users").doc(ADMIN_UID);
 
-const creatorId = videoData.userId;
-
-if(!creatorId){
-return res.status(400).json({error:"invalid creator"});
-}
-
-if(fromUser === creatorId){
-return res.status(400).json({error:"can not send gift to yourself"});
-}
-
-// USERS
-const senderRef = db.collection("users").doc(fromUser);
-const creatorRef = db.collection("users").doc(creatorId);
-const adminRef = db.collection("users").doc(ADMIN_UID);
-
-const senderSnap = await senderRef.get();
-const creatorSnap = await creatorRef.get();
-
-const senderDataTop = senderSnap.data() || {};
-
-if(senderDataTop.suspended === true){
-  return res.status(403).json({error:"account suspended"});
-}
-
-if(!senderSnap.exists){
-return res.status(404).json({error:"sender not found"});
-}
-
-
-if(!creatorSnap.exists){
-return res.status(404).json({error:"creator not found"});
-}
-
-
-
-// TRANSACTION
-await db.runTransaction(async t=>{
-
-  // 1️⃣ --- TOUTES LES LECTURES (READS) ---
-  const senderDoc = await t.get(senderRef);
-  if(!senderDoc.exists) throw new Error("sender not found");
-  
-  const creatorDoc = await t.get(creatorRef);
-  if(!creatorDoc.exists) throw new Error("creator not found");
-  
-  const adminDoc = await t.get(adminRef);
-  if(!adminDoc.exists) throw new Error("admin not found");
-  
-  const statsRef = db.collection("adminStats").doc("finance");
-  const statsDoc = await t.get(statsRef);
-
-  // 2️⃣ --- PRÉPARATION DES DONNÉES ---
-  const senderData = senderDoc.data() || {};
-  const { wallet, available } = getMoneyState(senderData);
-
-  if(wallet <= 0) throw new Error("wallet empty");
-  if(available < giftAmount) throw new Error("Solde disponible insuffisant");
-
-  const senderWallet = Number(senderData.wallet || 0);
-  const creatorData = creatorDoc.data() || {};
-  const creatorWallet = Number(creatorData.wallet || 0);
-  const creatorEarned = Number(creatorData.walletEarned || 0);
-  
-  const adminData = adminDoc.data() || {};
-  const adminWallet = Number(adminData.wallet || 0);
-  const adminEarned = Number(adminData.walletEarned || 0);
-
-  const giftRef = db.collection("giftTransactions").doc();
-  const senderTx = db.collection("walletTransactions").doc();
-  const receiverTx = db.collection("walletTransactions").doc();
-  const adminTx = db.collection("walletTransactions").doc();
-  const notifRef = db.collection("notifications").doc();
-
-  const isSenderAdmin = (fromUser === ADMIN_UID);
-  const isCreatorAdmin = (creatorId === ADMIN_UID);
-
-  // 3️⃣ --- TOUTES LES ÉCRITURES (WRITES) SANS CONFLITS ---
-
-  if (isCreatorAdmin) {
-    // CAS 1 : UN UTILISATEUR NORMAL ENVOIE À L'ADMIN
-    const newSenderBalance = senderWallet - giftAmount;
-    const totalAdminGain = gift.creator + gift.admin;
-    const newAdminBalance = adminWallet + totalAdminGain;
-    const newAdminEarned = adminEarned + totalAdminGain;
-
-    t.update(senderRef, { wallet: newSenderBalance });
-    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
-
-    t.set(receiverTx,{
-      userId: ADMIN_UID,
-      type: "gift_received",
-      amount: gift.creator,
-      senderId: fromUser,
-      videoId: videoId,
-      balanceAfter: newAdminBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    t.set(adminTx,{
-      userId: ADMIN_UID,
-      type: "gift_commission_received",
-      amount: gift.admin,
-      senderId: fromUser,
-      receiverId: creatorId,
-      videoId: videoId,
-      balanceAfter: newAdminBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-  } else if (isSenderAdmin) {
-    // CAS 2 : L'ADMIN ENVOIE À UN UTILISATEUR NORMAL
-    const newCreatorBalance = creatorWallet + gift.creator;
-    const newCreatorEarned = creatorEarned + gift.creator;
-    
-    // 🔥 CORRECTION ICI : L'admin paie le total (giftAmount), mais récupère sa propre taxe (gift.admin).
-    const newAdminBalance = adminWallet - giftAmount + gift.admin;
-    const newAdminEarned = adminEarned + gift.admin;
-
-    t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
-    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
-
-    t.set(receiverTx,{
-      userId: creatorId,
-      type: "gift_received",
-      amount: gift.creator,
-      senderId: fromUser,
-      videoId: videoId,
-      balanceAfter: newCreatorBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    t.set(adminTx,{
-      userId: ADMIN_UID,
-      type: "gift_commission_received",
-      amount: gift.admin,
-      senderId: fromUser,
-      receiverId: creatorId,
-      videoId: videoId,
-      balanceAfter: newAdminBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-  } else {
-    // CAS 3 : UN UTILISATEUR NORMAL ENVOIE À UN AUTRE UTILISATEUR NORMAL
-    const newSenderBalance = senderWallet - giftAmount;
-    const newCreatorBalance = creatorWallet + gift.creator;
-    const newCreatorEarned = creatorEarned + gift.creator;
-    const newAdminBalance = adminWallet + gift.admin;
-    const newAdminEarned = adminEarned + gift.admin;
-
-    t.update(senderRef, { wallet: newSenderBalance });
-    t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
-    t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
-
-    t.set(receiverTx,{
-      userId: creatorId,
-      type: "gift_received",
-      amount: gift.creator,
-      senderId: fromUser,
-      videoId: videoId,
-      balanceAfter: newCreatorBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    t.set(adminTx,{
-      userId: ADMIN_UID,
-      type: "gift_commission_received",
-      amount: gift.admin,
-      senderId: fromUser,
-      receiverId: creatorId,
-      videoId: videoId,
-      balanceAfter: newAdminBalance,
-      status: "completed",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-  }
-
-  // Historique cadeau général
-  t.set(giftRef,{
-    from: fromUser,
-    to: creatorId,
-    videoId: videoId,
-    amount: giftAmount,
-    creatorEarn: gift.creator,
-    adminEarn: gift.admin,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
-
-  // Transaction de sortie (Wallet)
-  let finalSenderBalForTx = senderWallet - giftAmount;
-  if(isSenderAdmin) finalSenderBalForTx = adminWallet - giftAmount + gift.admin;
-
-  t.set(senderTx,{
-    userId: fromUser,
-    type: "gift_sent",
-    amount: giftAmount,
-    receiverId: creatorId,
-    videoId: videoId,
-    balanceAfter: finalSenderBalForTx,
-    status: "completed",
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
-
-  // Notification créateur
-  t.set(notifRef,{
-    to: creatorId,
-    from: fromUser,
-    fromUsername: senderData.username || "Utilisateur",
-    fromAvatar: senderData.avatar || null,
-    type: "gift",
-    videoId: videoId,
-    amount: giftAmount,
-    read: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
-
-  // 🔥 MISE À JOUR ADMIN STATS - GIFT
-  let stats = statsDoc.exists ? statsDoc.data() : {
-    totalIn: 0,
-    totalOut: 0,
-    netTotal: 0,
-    transactionsCount: 0,
-    typeTotals: {}
-  };
-
-  const amountValue = gift.admin;
-  const typeStat = "gift_commission_received";
-
-  if(!stats.typeTotals[typeStat]){
-    stats.typeTotals[typeStat] = { in:0, out:0, count:0 };
-  }
-
-  stats.totalIn += amountValue;
-  stats.transactionsCount += 1;
-  stats.typeTotals[typeStat].in += amountValue;
-  stats.typeTotals[typeStat].count += 1;
-  stats.netTotal = stats.totalIn - stats.totalOut;
-
-  t.set(statsRef, stats);
-
-});
-
-
-// --- DÉBUT DU DÉCLENCHEUR PUSH CADEAU ---
     const senderSnap = await senderRef.get();
+    const creatorSnap = await creatorRef.get();
+
+    const senderDataTop = senderSnap.data() || {};
+
+    if(senderDataTop.suspended === true){
+      return res.status(403).json({error:"account suspended"});
+    }
+
+    if(!senderSnap.exists){
+      return res.status(404).json({error:"sender not found"});
+    }
+
+    if(!creatorSnap.exists){
+      return res.status(404).json({error:"creator not found"});
+    }
+
+    // TRANSACTION
+    await db.runTransaction(async t=>{
+
+      // 1️⃣ --- TOUTES LES LECTURES (READS) ---
+      const senderDoc = await t.get(senderRef);
+      if(!senderDoc.exists) throw new Error("sender not found");
+      
+      const creatorDoc = await t.get(creatorRef);
+      if(!creatorDoc.exists) throw new Error("creator not found");
+      
+      const adminDoc = await t.get(adminRef);
+      if(!adminDoc.exists) throw new Error("admin not found");
+      
+      const statsRef = db.collection("adminStats").doc("finance");
+      const statsDoc = await t.get(statsRef);
+
+      // 2️⃣ --- PRÉPARATION DES DONNÉES ---
+      const senderData = senderDoc.data() || {};
+      const { wallet, available } = getMoneyState(senderData);
+
+      if(wallet <= 0) throw new Error("wallet empty");
+      if(available < giftAmount) throw new Error("Solde disponible insuffisant");
+
+      const senderWallet = Number(senderData.wallet || 0);
+      const creatorData = creatorDoc.data() || {};
+      const creatorWallet = Number(creatorData.wallet || 0);
+      const creatorEarned = Number(creatorData.walletEarned || 0);
+      
+      const adminData = adminDoc.data() || {};
+      const adminWallet = Number(adminData.wallet || 0);
+      const adminEarned = Number(adminData.walletEarned || 0);
+
+      const giftRef = db.collection("giftTransactions").doc();
+      const senderTx = db.collection("walletTransactions").doc();
+      const receiverTx = db.collection("walletTransactions").doc();
+      const adminTx = db.collection("walletTransactions").doc();
+      const notifRef = db.collection("notifications").doc();
+
+      const isSenderAdmin = (fromUser === ADMIN_UID);
+      const isCreatorAdmin = (creatorId === ADMIN_UID);
+
+      // 3️⃣ --- TOUTES LES ÉCRITURES (WRITES) ---
+      if (isCreatorAdmin) {
+        const newSenderBalance = senderWallet - giftAmount;
+        const totalAdminGain = gift.creator + gift.admin;
+        const newAdminBalance = adminWallet + totalAdminGain;
+        const newAdminEarned = adminEarned + totalAdminGain;
+
+        t.update(senderRef, { wallet: newSenderBalance });
+        t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
+
+        t.set(receiverTx,{
+          userId: ADMIN_UID,
+          type: "gift_received",
+          amount: gift.creator,
+          senderId: fromUser,
+          videoId: videoId,
+          balanceAfter: newAdminBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.set(adminTx,{
+          userId: ADMIN_UID,
+          type: "gift_commission_received",
+          amount: gift.admin,
+          senderId: fromUser,
+          receiverId: creatorId,
+          videoId: videoId,
+          balanceAfter: newAdminBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+      } else if (isSenderAdmin) {
+        const newCreatorBalance = creatorWallet + gift.creator;
+        const newCreatorEarned = creatorEarned + gift.creator;
+        const newAdminBalance = adminWallet - giftAmount + gift.admin;
+        const newAdminEarned = adminEarned + gift.admin;
+
+        t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
+        t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
+
+        t.set(receiverTx,{
+          userId: creatorId,
+          type: "gift_received",
+          amount: gift.creator,
+          senderId: fromUser,
+          videoId: videoId,
+          balanceAfter: newCreatorBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.set(adminTx,{
+          userId: ADMIN_UID,
+          type: "gift_commission_received",
+          amount: gift.admin,
+          senderId: fromUser,
+          receiverId: creatorId,
+          videoId: videoId,
+          balanceAfter: newAdminBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+      } else {
+        const newSenderBalance = senderWallet - giftAmount;
+        const newCreatorBalance = creatorWallet + gift.creator;
+        const newCreatorEarned = creatorEarned + gift.creator;
+        const newAdminBalance = adminWallet + gift.admin;
+        const newAdminEarned = adminEarned + gift.admin;
+
+        t.update(senderRef, { wallet: newSenderBalance });
+        t.update(creatorRef, { wallet: newCreatorBalance, walletEarned: newCreatorEarned });
+        t.update(adminRef, { wallet: newAdminBalance, walletEarned: newAdminEarned });
+
+        t.set(receiverTx,{
+          userId: creatorId,
+          type: "gift_received",
+          amount: gift.creator,
+          senderId: fromUser,
+          videoId: videoId,
+          balanceAfter: newCreatorBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.set(adminTx,{
+          userId: ADMIN_UID,
+          type: "gift_commission_received",
+          amount: gift.admin,
+          senderId: fromUser,
+          receiverId: creatorId,
+          videoId: videoId,
+          balanceAfter: newAdminBalance,
+          status: "completed",
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+
+      t.set(giftRef,{
+        from: fromUser,
+        to: creatorId,
+        videoId: videoId,
+        amount: giftAmount,
+        creatorEarn: gift.creator,
+        adminEarn: gift.admin,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      let finalSenderBalForTx = senderWallet - giftAmount;
+      if(isSenderAdmin) finalSenderBalForTx = adminWallet - giftAmount + gift.admin;
+
+      t.set(senderTx,{
+        userId: fromUser,
+        type: "gift_sent",
+        amount: giftAmount,
+        receiverId: creatorId,
+        videoId: videoId,
+        balanceAfter: finalSenderBalForTx,
+        status: "completed",
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      t.set(notifRef,{
+        to: creatorId,
+        from: fromUser,
+        fromUsername: senderData.username || "Utilisateur",
+        fromAvatar: senderData.avatar || null,
+        type: "gift",
+        videoId: videoId,
+        amount: giftAmount,
+        read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      let stats = statsDoc.exists ? statsDoc.data() : {
+        totalIn: 0,
+        totalOut: 0,
+        netTotal: 0,
+        transactionsCount: 0,
+        typeTotals: {}
+      };
+
+      const amountValue = gift.admin;
+      const typeStat = "gift_commission_received";
+
+      if(!stats.typeTotals[typeStat]){
+        stats.typeTotals[typeStat] = { in:0, out:0, count:0 };
+      }
+
+      stats.totalIn += amountValue;
+      stats.transactionsCount += 1;
+      stats.typeTotals[typeStat].in += amountValue;
+      stats.typeTotals[typeStat].count += 1;
+      stats.netTotal = stats.totalIn - stats.totalOut;
+
+      t.set(statsRef, stats);
+    });
+
+    // --- DÉCLENCHEUR PUSH CADEAU (Utilise senderSnap déjà défini plus haut) ---
     const senderUsername = senderSnap.data()?.username || "Un utilisateur";
 
     await sendPushNotification(
-      creatorId, // ID de la personne qui reçoit le cadeau
+      creatorId,
       "Nouveau Cadeau ! 🎁",
       `${senderUsername} vous a envoyé un cadeau d'une valeur de ${giftAmount} !`,
       { type: "gift", amount: String(giftAmount) }
     );
-    // --- FIN DU DÉCLENCHEUR PUSH CADEAU ---
 
+    res.json({ success: true });
 
-
-
-res.json({ success: true });
-
-}catch(e){
-
-console.log("GIFT ERROR:", e);
-
-res.status(500).json({
-error: e.message
+  } catch(e) {
+    console.log("GIFT ERROR:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
-
-}
-
-});
-
 
 
 
@@ -3525,6 +3494,9 @@ app.get("/api/admin/finance-summary", async (req, res) => {
 app.get("/", (req, res) => {
   res.send("HaytiClips backend OK");
 });
+
+
+
 
 
 /* =======================================================

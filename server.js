@@ -749,6 +749,41 @@ app.post("/api/save-fcm-token", verifyFirebaseToken, async (req, res) => {
 
 
 
+
+
+
+app.post("/api/check-and-clean-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email requis" });
+
+  try {
+    // 1. Retrouver l'utilisateur dans Auth grâce à son email
+    const userRecord = await admin.auth().getUserByEmail(email);
+
+    // 2. Vérifier si son document Firestore existe
+    const userDoc = await admin.firestore().collection("users").doc(userRecord.uid).get();
+
+    if (!userDoc.exists) {
+      // Pas de document -> On supprime le compte Auth orphelin
+      await admin.auth().deleteUser(userRecord.uid);
+      console.log(`Compte orphelin supprimé pour l'email : ${email}`);
+      return res.json({ cleaned: true });
+    }
+
+    // Le document existe vraiment -> L'email est légitimement pris
+    return res.json({ cleaned: false });
+
+  } catch (err) {
+    if (err.code === "auth/user-not-found") {
+      return res.json({ cleaned: false });
+    }
+    console.error("Erreur nettoyage email:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
+
 /* ================= WALLET WITHDRAW ================= */
 
 

@@ -23,7 +23,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const app = express();
 
 
-
 // ================= MOTEUR DE NOTIFICATIONS PUSH =================
 async function sendPushNotification(targetUid, title, body, extraData = {}) {
   try {
@@ -36,10 +35,20 @@ async function sendPushNotification(targetUid, title, body, extraData = {}) {
       return;
     }
 
+    // 🔥 MODIFICATION : Forcer toutes les valeurs de data en String
+    const safeData = {};
+    if (extraData) {
+      for (const key in extraData) {
+        if (extraData[key] !== undefined && extraData[key] !== null) {
+          safeData[key] = String(extraData[key]);
+        }
+      }
+    }
+
     const message = {
       token: token,
       notification: { title: title, body: body },
-      data: extraData
+      data: safeData
     };
 
     const response = await admin.messaging().send(message);
@@ -49,6 +58,7 @@ async function sendPushNotification(targetUid, title, body, extraData = {}) {
   }
 }
 // ================================================================
+
 
 
 
@@ -1549,7 +1559,7 @@ merchantRenewalBlocked: false,
           enabled: false
         },
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    }); { merge: true }); 
 
     return res.json({ success: true });
 
@@ -3109,9 +3119,19 @@ app.post("/api/blue/approve-payment", verifyFirebaseToken, async (req,res)=>{
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       // ================= FIN DES MODIFICATIONS =================
-    });
+
+}); // Fin du db.runTransaction
+
+    // 🔥 MODIFICATION : Déclencheur Push
+    await sendPushNotification(
+      paymentData.userId,
+      "Badge Blue Approuvé ! ✅",
+      "Félicitations, votre compte a été vérifié.",
+      { type: "blue_approved" }
+    );
 
     return res.json({success:true});
+
 
   }catch(e){
     console.log("BLUE APPROVE ERROR:", e);

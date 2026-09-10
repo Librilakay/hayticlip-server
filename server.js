@@ -1559,7 +1559,7 @@ merchantRenewalBlocked: false,
           enabled: false
         },
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }); { merge: true }); 
+    }, { merge: true }); 
 
     return res.json({ success: true });
 

@@ -3254,8 +3254,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       const timestamps = ['25%', '50%', '75%'];
 
       for (let i = 0; i < timestamps.length; i++) {
-        const isMiddleFrame = (timestamps[i] === '50%');
-
         if (modStatus === "flagged") {
           console.log(`🛑 [IA] Vidéo déjà flaggée, on arrête les tests suivants pour économiser le quota.`);
           break; 
@@ -3283,7 +3281,8 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           const data = new FormData();
           
           data.append('media', fs.createReadStream(currentFramePath));
-          data.append('models', 'nudity-2.0,wad,gore,text-detection'); 
+          // 🔥 CORRECTION 1 : Le vrai nom du modèle Sightengine est 'text', pas 'text-detection'
+          data.append('models', 'nudity-2.0,wad,gore,text'); 
           data.append('api_user', process.env.SIGHTENGINE_USER);
           data.append('api_secret', process.env.SIGHTENGINE_SECRET);
 
@@ -3297,14 +3296,12 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           const result = response.data;
           
           if (result.status === "success") {
-            // --- 📌 VÉRIFICATION DU MOT "TIKTOK" SUR LA FRAME DU MILIEU (50%) ---
-            if (isMiddleFrame) {
-              const fullResponseText = JSON.stringify(result).toLowerCase();
-              
-              if (fullResponseText.includes("tiktok")) {
-                console.log(`⚠️ [IA] Mot 'tiktok' détecté dans la frame du milieu (${timestamps[i]}) !`);
-                modStatus = "pending_ia";
-              }
+            const fullResponseText = JSON.stringify(result).toLowerCase();
+            
+            // 🔥 CORRECTION 2 : On vérifie "tiktok" sur TOUTES les frames et on passe en "flagged" direct
+            if (fullResponseText.includes("tiktok")) {
+              console.log(`⚠️ [IA] Mot 'tiktok' détecté ! Blocage de la vidéo.`);
+              modStatus = "flagged";
             }
 
             // --- 🔞 VÉRIFICATION DE LA NUDITÉ ET CONTENUS SENSIBLES ---
@@ -3368,23 +3365,46 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
 
     // =========================================================================
-    // 3️⃣ REMPLACEMENT DANS SUPABASE
+    // 3️⃣ REMPLACEMENT DANS SUPABASE ET SUPPRESSION DE L'ANCIENNE VIDÉO
     // =========================================================================
+    let newVideoUrl = videoUrl;
+    let newFilePath = filePath;
+
     if (compressionSuccess && fs.existsSync(outputPath)) {
       console.log(`☁️ [3/4] Remplacement sur Supabase...`);
       const fileBuffer = fs.readFileSync(outputPath);
 
+      // 🔥 CORRECTION 3 : On crée un nouveau nom de fichier pour être sûr de contourner le cache
+      newFilePath = filePath.replace(/\.[^/.]+$/, "") + `_comp_${Date.now()}.mp4`;
+
       const { error: uploadError } = await supabase.storage
         .from("media")
-        .upload(filePath, fileBuffer, {
-          contentType: "video/mp4",
-          upsert: true 
+        .upload(newFilePath, fileBuffer, {
+          contentType: "video/mp4"
         });
 
       if (uploadError) {
-        console.error("❌ Erreur Supabase :", uploadError.message);
+        console.error("❌ Erreur Supabase Upload :", uploadError.message);
       } else {
-        console.log("☁️ Vidéo optimisée sauvegardée sur le cloud.");
+        console.log("☁️ Vidéo compressée sauvegardée sur le cloud.");
+
+        // Récupérer la nouvelle URL publique
+        const { data: publicUrlData } = supabase.storage
+          .from("media")
+          .getPublicUrl(newFilePath);
+        
+        newVideoUrl = publicUrlData.publicUrl;
+
+        // 🔥 EFFACER L'ANCIENNE VIDÉO NON COMPRESSÉE
+        const { error: removeError } = await supabase.storage
+          .from("media")
+          .remove([filePath]);
+
+        if (removeError) {
+          console.error("❌ Erreur lors de la suppression de l'ancienne vidéo :", removeError.message);
+        } else {
+          console.log("🗑️ Ancienne vidéo non compressée supprimée avec succès.");
+        }
       }
     }
 
@@ -3393,8 +3413,11 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     // =========================================================================
     console.log(`🔥 [4/4] Mise à jour Firestore (Statut: ${modStatus})`);
     
+    // 🔥 CORRECTION : On met à jour l'URL et le path pour que l'app utilise la vidéo compressée
     await db.collection("videos").doc(videoId).update({
-      moderationStatus: modStatus 
+      moderationStatus: modStatus,
+      videoUrl: newVideoUrl,
+      filePath: newFilePath
     });
 
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -3408,6 +3431,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     });
   }
 });
+
 
 
 // ================= ADMIN FINANCE SUMMARY =================

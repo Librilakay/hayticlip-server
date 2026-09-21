@@ -3238,6 +3238,7 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ error: "Données manquantes" });
     }
 
+    // Réponse immédiate pour éviter les timeouts HTTP
     res.json({ success: true, message: "Traitement démarré en arrière-plan" });
 
     if (!fs.existsSync('uploads')) {
@@ -3248,14 +3249,14 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     let modStatus = "clean";
 
     // =========================================================================
-    // 1️⃣ EXTRACTION IA ET ENVOI À SIGHTENGINE (Analyse multiple + TikTok check)
+    // 1️⃣ EXTRACTION ET ANALYSE IA SIGHTENGINE
     // =========================================================================
     try {
       const timestamps = ['25%', '50%', '75%'];
 
       for (let i = 0; i < timestamps.length; i++) {
         if (modStatus === "flagged") {
-          console.log(`🛑 [IA] Vidéo déjà flaggée, on arrête les tests suivants pour économiser le quota.`);
+          console.log(`🛑 [IA] Vidéo déjà flaggée, arrêt des vérifications.`);
           break; 
         }
 
@@ -3281,7 +3282,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           const data = new FormData();
           
           data.append('media', fs.createReadStream(currentFramePath));
-          // 🔥 CORRECTION 1 : Le vrai nom du modèle Sightengine est 'text', pas 'text-detection'
           data.append('models', 'nudity-2.0,wad,gore,text'); 
           data.append('api_user', process.env.SIGHTENGINE_USER);
           data.append('api_secret', process.env.SIGHTENGINE_SECRET);
@@ -3298,13 +3298,13 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           if (result.status === "success") {
             const fullResponseText = JSON.stringify(result).toLowerCase();
             
-            // 🔥 CORRECTION 2 : On vérifie "tiktok" sur TOUTES les frames et on passe en "flagged" direct
+            // Détection de TikTok
             if (fullResponseText.includes("tiktok")) {
               console.log(`⚠️ [IA] Mot 'tiktok' détecté ! Blocage de la vidéo.`);
               modStatus = "flagged";
             }
 
-            // --- 🔞 VÉRIFICATION DE LA NUDITÉ ET CONTENUS SENSIBLES ---
+            // Détection Nudité & contenus interdits
             if (result.nudity) {
               if (
                 result.nudity.sexual_activity > 0.5 || 
@@ -3335,92 +3335,92 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
 
     // =========================================================================
-    // 2️⃣ COMPRESSION OBLIGATOIRE
+    // 2️⃣ MISE À JOUR SELON LE RÉSULTAT DE LA MODÉRATION
     // =========================================================================
-    let compressionSuccess = false;
 
-    try {
-      console.log(`⚡ [2/4] Compression pour ${videoId}...`);
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoUrl)
-          .outputOptions([
-            "-vf scale='min(480,iw)':-2",
-            "-r 24",
-            "-c:v libx264",
-            "-preset ultrafast",
-            "-crf 30",
-            "-threads 1",
-            "-c:a aac",
-            "-b:a 64k",
-            "-movflags +faststart"
-          ])
-          .save(outputPath)
-          .on("end", resolve)
-          .on("error", reject);
+    if (modStatus === "flagged") {
+      // 🛑 SI FLAGGÉE : On ne remplace pas l'URL de la vidéo dans Firestore
+      console.log(`🛑 [2/4] Vidéo flaggée. Mise à jour du statut dans Firestore sans modifier l'URL.`);
+      await db.collection("videos").doc(videoId).update({
+        moderationStatus: "flagged"
       });
-      compressionSuccess = true;
-      console.log(`⚡ Compression réussie !`);
-    } catch (compError) {
-      console.error(`❌ Échec de la compression :`, compError.message);
-    }
-
-    // =========================================================================
-    // 3️⃣ REMPLACEMENT DANS SUPABASE ET SUPPRESSION DE L'ANCIENNE VIDÉO
-    // =========================================================================
-    let newVideoUrl = videoUrl;
-    let newFilePath = filePath;
-
-    if (compressionSuccess && fs.existsSync(outputPath)) {
-      console.log(`☁️ [3/4] Remplacement sur Supabase...`);
-      const fileBuffer = fs.readFileSync(outputPath);
-
-      // 🔥 CORRECTION 3 : On crée un nouveau nom de fichier pour être sûr de contourner le cache
-      newFilePath = filePath.replace(/\.[^/.]+$/, "") + `_comp_${Date.now()}.mp4`;
-
-      const { error: uploadError } = await supabase.storage
-        .from("media")
-        .upload(newFilePath, fileBuffer, {
-          contentType: "video/mp4"
+    } else {
+      // ✅ SI CLEAN : Compression & Remplacement complet
+      let compressionSuccess = false;
+      try {
+        console.log(`⚡ [2/4] Compression de la vidéo ${videoId}...`);
+        await new Promise((resolve, reject) => {
+          ffmpeg(videoUrl)
+            .outputOptions([
+              "-vf scale='min(480,iw)':-2",
+              "-r 24",
+              "-c:v libx264",
+              "-preset ultrafast",
+              "-crf 30",
+              "-threads 1",
+              "-c:a aac",
+              "-b:a 64k",
+              "-movflags +faststart"
+            ])
+            .save(outputPath)
+            .on("end", resolve)
+            .on("error", reject);
         });
+        compressionSuccess = true;
+        console.log(`⚡ Compression réussie !`);
+      } catch (compError) {
+        console.error(`❌ Échec de la compression :`, compError.message);
+      }
 
-      if (uploadError) {
-        console.error("❌ Erreur Supabase Upload :", uploadError.message);
-      } else {
-        console.log("☁️ Vidéo compressée sauvegardée sur le cloud.");
+      let newVideoUrl = videoUrl;
+      let newFilePath = filePath;
 
-        // Récupérer la nouvelle URL publique
-        const { data: publicUrlData } = supabase.storage
+      if (compressionSuccess && fs.existsSync(outputPath)) {
+        console.log(`☁️ [3/4] Upload sur Supabase...`);
+        const fileBuffer = fs.readFileSync(outputPath);
+
+        newFilePath = filePath.replace(/\.[^/.]+$/, "") + `_comp_${Date.now()}.mp4`;
+
+        const { error: uploadError } = await supabase.storage
           .from("media")
-          .getPublicUrl(newFilePath);
-        
-        newVideoUrl = publicUrlData.publicUrl;
+          .upload(newFilePath, fileBuffer, {
+            contentType: "video/mp4"
+          });
 
-        // 🔥 EFFACER L'ANCIENNE VIDÉO NON COMPRESSÉE
-        const { error: removeError } = await supabase.storage
-          .from("media")
-          .remove([filePath]);
-
-        if (removeError) {
-          console.error("❌ Erreur lors de la suppression de l'ancienne vidéo :", removeError.message);
+        if (uploadError) {
+          console.error("❌ Erreur Supabase Upload :", uploadError.message);
         } else {
-          console.log("🗑️ Ancienne vidéo non compressée supprimée avec succès.");
+          console.log("☁️ Vidéo compressée sauvegardée sur Supabase.");
+
+          const { data: publicUrlData } = supabase.storage
+            .from("media")
+            .getPublicUrl(newFilePath);
+          
+          newVideoUrl = publicUrlData.publicUrl;
+
+          // Suppression de l'ancienne version lourde
+          const { error: removeError } = await supabase.storage
+            .from("media")
+            .remove([filePath]);
+
+          if (removeError) {
+            console.error("❌ Erreur lors de la suppression de l'ancienne vidéo :", removeError.message);
+          } else {
+            console.log("🗑️ Ancienne vidéo non compressée supprimée.");
+          }
         }
       }
+
+      // Mise à jour finale dans Firestore avec la nouvelle URL
+      console.log(`🔥 [4/4] Mise à jour Firestore (Statut: clean, URL mise à jour)`);
+      await db.collection("videos").doc(videoId).update({
+        moderationStatus: "clean",
+        videoUrl: newVideoUrl,
+        filePath: newFilePath
+      });
     }
 
-    // =========================================================================
-    // 4️⃣ MISE À JOUR FIRESTORE
-    // =========================================================================
-    console.log(`🔥 [4/4] Mise à jour Firestore (Statut: ${modStatus})`);
-    
-    // 🔥 CORRECTION : On met à jour l'URL et le path pour que l'app utilise la vidéo compressée
-    await db.collection("videos").doc(videoId).update({
-      moderationStatus: modStatus,
-      videoUrl: newVideoUrl,
-      filePath: newFilePath
-    });
-
-    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     console.log(`🎉 PROCESSUS TERMINÉ AVEC SUCCÈS POUR ${videoId}`);
 
   } catch (e) {
@@ -3431,7 +3431,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     });
   }
 });
-
 
 
 // ================= ADMIN FINANCE SUMMARY =================

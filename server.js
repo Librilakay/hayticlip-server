@@ -3253,8 +3253,10 @@ const MODERATION_CONFIG = {
   forbiddenKeywords: ["tiktok"]
 };
 
+
+
 app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
-  const { videoId } = req.body;
+  const { videoId, videoUrl: bodyVideoUrl, filePath: bodyFilePath } = req.body;
 
   if (!videoId || typeof videoId !== "string") {
     return res.status(400).json({ error: "videoId requis" });
@@ -3284,16 +3286,19 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     return res.status(409).json({ error: "Traitement déjà en cours pour cette vidéo" });
   }
 
-  const sourceVideoUrl = videoData.videoUrl;
-  const oldFilePath = videoData.filePath;
+  // Fallbacks intelligents si les champs manquent dans Firestore
+  const sourceVideoUrl = videoData.videoUrl || (videoData.mediaUrls && videoData.mediaUrls[0]) || bodyVideoUrl;
+  const oldFilePath = videoData.filePath || bodyFilePath;
 
   if (!sourceVideoUrl || !oldFilePath) {
-    return res.status(400).json({ error: "Metadonnées vidéo incomplètes dans Firestore" });
+    return res.status(400).json({ error: "Metadonnées vidéo incomplètes (videoUrl/filePath)" });
   }
 
   // Passer Firestore en statut 'processing'
   await videoRef.update({
     moderationStatus: "processing",
+    videoUrl: sourceVideoUrl,
+    filePath: oldFilePath,
     processingStartedAt: admin.firestore.FieldValue.serverTimestamp()
   });
 
@@ -3371,7 +3376,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
           if (result && result.status === "success") {
             sightengineSuccess = true;
 
-            // Détection textuelle (ex: filigrane TikTok)
             const fullJsonStr = JSON.stringify(result).toLowerCase();
             for (const kw of MODERATION_CONFIG.forbiddenKeywords) {
               if (fullJsonStr.includes(kw)) {
@@ -3381,7 +3385,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
               }
             }
 
-            // Détection Nudité
             if (result.nudity) {
               if (
                 (result.nudity.sexual_activity || 0) > MODERATION_CONFIG.nuditySexualActivity ||
@@ -3393,7 +3396,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
               }
             }
 
-            // Détection Gore, Armes, Drogues
             if (result.gore && (result.gore.prob || 0) > MODERATION_CONFIG.goreProb) modStatus = "flagged";
             if (result.wad) {
               if ((result.wad.weapons || 0) > MODERATION_CONFIG.wadWeapons) modStatus = "flagged";
@@ -3403,14 +3405,12 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         }
       }
 
-      // Si l'IA plante complètement, on passe en statut d'erreur (ne pas considérer clean)
       if (!sightengineSuccess && modStatus !== "flagged") {
         throw new Error("L'analyse Sightengine n'a pu s'exécuter sur aucune image");
       }
 
       console.log(`🤖 Résultat IA Final pour ${videoId} : ${modStatus}`);
 
-      // 4️⃣ TRAITEMENT SI FLAGGÉE
       if (modStatus === "flagged") {
         console.log(`🛑 Vidéo ${videoId} bloquée par la modération.`);
         await videoRef.update({
@@ -3420,38 +3420,35 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         return;
       }
 
-
-// 5️⃣ COMPRESSION FFMPEG ULTRA-LÉGÈRE (Qualité réduite)
-      console.log(`⚡ [3/5] Compression ultra-agressive (qualité réduite) pour ${videoId}...`);
+      // 5️⃣ COMPRESSION FFMPEG FORCÉE (DÉBIT STRICT 300K)
+      console.log(`⚡ [3/5] Compression FFmpeg ultra-agressive pour ${videoId}...`);
       await new Promise((resolve, reject) => {
         ffmpeg(localVideoPath)
           .outputOptions([
-            "-vf scale='min(360,iw)':-2", // 1. Passage en 360p max (ex: 360x640)
-            "-fpsmax 24",                 // 2. Plafond à 24 FPS max
-            "-c:v libx264",               // 3. Codec vidéo H.264
-            "-preset medium",             // 4. Preset medium pour optimiser la taille
-            "-crf 35",                    // 5. 🔥 CRF 35 : Qualité visuelle nettement réduite, fichier très léger
-            "-maxrate 350k",              // 6. Plafond strict du débit vidéo à 350 kb/s
-            "-bufsize 700k",              // 6. Tampon pour le contrôle du débit
-            "-c:a aac",                   // 7. Codec audio AAC
-            "-b:a 48k",                   // 7. Audio réduit à 48 kbps
-            "-ac 1",                      // 7. Son converti en Mono (gain de poids supplémentaire)
-            "-pix_fmt yuv420p",           // 8. Compatibilité iOS/Android
-            "-movflags +faststart"        // 9. Démarrage rapide streaming MP4
+            "-vf scale='min(360,iw)':-2", // Résolution 360p max
+            "-r 24",                       // Plafond 24 FPS
+            "-c:v libx264",                // Codec H.264
+            "-b:v 300k",                   // 🔥 Force un débit vidéo maximal de 300 kbps
+            "-maxrate 400k",               // Plafond strict
+            "-bufsize 600k",               // Tampon
+            "-preset medium",              // Meilleure compression
+            "-c:a aac",                    // Codec audio AAC
+            "-b:a 48k",                    // Audio 48 kbps
+            "-ac 1",                       // Son Mono
+            "-pix_fmt yuv420p",            // Compatible mobile
+            "-movflags +faststart"         // Streaming rapide
           ])
           .save(compressedVideoPath)
           .on("end", resolve)
           .on("error", reject);
       });
 
-
-
       const stats = await fs.promises.stat(compressedVideoPath);
       if (stats.size === 0) {
         throw new Error("Le fichier vidéo compressé produit est vide");
       }
 
-      // 6️⃣ UPLOAD SUPABASE VIA STREAM (Évite la saturation RAM)
+      // 6️⃣ UPLOAD SUPABASE VIA STREAM
       console.log(`☁️ [4/5] Upload sur Supabase via Stream...`);
       newUploadedFilePath = oldFilePath.replace(/\.[^/.]+$/, "") + `_comp_${Date.now()}.mp4`;
 
@@ -3473,16 +3470,17 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
 
       const newVideoUrl = publicUrlData.publicUrl;
 
-      // 7️⃣ MISE À JOUR FIRESTORE EN PREMIER
+      // 7️⃣ MISE À JOUR FIRESTORE (videoUrl + mediaUrls)
       console.log(`🔥 [5/5] Enregistrement dans Firestore...`);
       await videoRef.update({
         moderationStatus: "clean",
         videoUrl: newVideoUrl,
+        mediaUrls: [newVideoUrl], // 👈 Met aussi à jour le tableau mediaUrls pour l'application !
         filePath: newUploadedFilePath,
         processingEndedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // 8️⃣ SUPPRESSION DE L'ANCIENNE VIDÉO LOURDE (Seulement après validation Firestore)
+      // 8️⃣ SUPPRESSION DE L'ANCIENNE VIDÉO NON COMPRESSÉE
       try {
         const { error: removeError } = await supabase.storage
           .from("media")
@@ -3502,7 +3500,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     } catch (err) {
       console.error(`❌ ERREUR OPTIMISATION VIDÉO (${videoId}) :`, err.message);
 
-      // Rollback Supabase si un fichier a été téléversé avant l'erreur
       if (newUploadedFilePath) {
         try {
           await supabase.storage.from("media").remove([newUploadedFilePath]);
@@ -3511,7 +3508,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         }
       }
 
-      // Mettre Firestore en statut 'failed' pour informer l'application
       try {
         await videoRef.update({
           moderationStatus: "failed",
@@ -3522,7 +3518,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         console.error("Erreur mise à jour statut 'failed' :", fsErr.message);
       }
     } finally {
-      // Nettoyage garanti de tous les fichiers temporaires
       await unlinkSafe(localVideoPath);
       await unlinkSafe(compressedVideoPath);
       for (const fPath of framePaths) {
@@ -3531,7 +3526,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
   })();
 });
-
 
 
 // ================= ADMIN FINANCE SUMMARY =================

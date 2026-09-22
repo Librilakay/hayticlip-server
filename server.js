@@ -3421,25 +3421,29 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       }
 
 
-// 5️⃣ COMPRESSION FFMPEG AGRESSIVE
-      console.log(`⚡ [3/5] Compression FFmpeg pour ${videoId}...`);
+// 5️⃣ COMPRESSION FFMPEG ULTRA-LÉGÈRE (Qualité réduite)
+      console.log(`⚡ [3/5] Compression ultra-agressive (qualité réduite) pour ${videoId}...`);
       await new Promise((resolve, reject) => {
         ffmpeg(localVideoPath)
           .outputOptions([
-            "-vf scale='min(720,iw)':-2", // 1. Résolution max 720p
-            "-r 30",                      // 2. Max 30 FPS
-            "-c:v libx264",               // 3. Encodage H.264
-            "-preset medium",             // 5. Preset medium (meilleure compression qu'ultrafast)
-            "-crf 32",                    // 4. CRF 32 pour réduire fortement le poids
-            "-c:a aac",                   // 6. Codec audio AAC
-            "-b:a 64k",                   // 6. Audio à 64 kbps
-            "-pix_fmt yuv420p",           // 7. Compatibilité universelle (iOS/Android)
-            "-movflags +faststart"        // 8. Démarrage rapide du streaming MP4
+            "-vf scale='min(360,iw)':-2", // 1. Passage en 360p max (ex: 360x640)
+            "-fpsmax 24",                 // 2. Plafond à 24 FPS max
+            "-c:v libx264",               // 3. Codec vidéo H.264
+            "-preset medium",             // 4. Preset medium pour optimiser la taille
+            "-crf 35",                    // 5. 🔥 CRF 35 : Qualité visuelle nettement réduite, fichier très léger
+            "-maxrate 350k",              // 6. Plafond strict du débit vidéo à 350 kb/s
+            "-bufsize 700k",              // 6. Tampon pour le contrôle du débit
+            "-c:a aac",                   // 7. Codec audio AAC
+            "-b:a 48k",                   // 7. Audio réduit à 48 kbps
+            "-ac 1",                      // 7. Son converti en Mono (gain de poids supplémentaire)
+            "-pix_fmt yuv420p",           // 8. Compatibilité iOS/Android
+            "-movflags +faststart"        // 9. Démarrage rapide streaming MP4
           ])
           .save(compressedVideoPath)
           .on("end", resolve)
           .on("error", reject);
       });
+
 
 
       const stats = await fs.promises.stat(compressedVideoPath);

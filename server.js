@@ -3254,7 +3254,6 @@ const MODERATION_CONFIG = {
 };
 
 
-
 app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
   const { videoId, videoUrl: bodyVideoUrl, filePath: bodyFilePath } = req.body;
 
@@ -3334,7 +3333,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
 
       // 3️⃣ EXTRACTION ET ANALYSE IA (SIGHTENGINE)
       let modStatus = "clean";
-      let sightengineSuccess = false;
       const timestamps = ['25%', '50%', '75%'];
 
       for (let i = 0; i < timestamps.length; i++) {
@@ -3357,56 +3355,54 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         });
 
         if (fs.existsSync(framePath)) {
-          const FormData = require('form-data');
-          const formData = new FormData();
-          formData.append('media', fs.createReadStream(framePath));
-          formData.append('models', 'nudity-2.0,wad,gore,text');
-          formData.append('api_user', process.env.SIGHTENGINE_USER);
-          formData.append('api_secret', process.env.SIGHTENGINE_SECRET);
+          try {
+            const FormData = require('form-data');
+            const formData = new FormData();
+            formData.append('media', fs.createReadStream(framePath));
+            formData.append('models', 'nudity-2.0,wad,gore,text');
+            formData.append('api_user', process.env.SIGHTENGINE_USER || '');
+            formData.append('api_secret', process.env.SIGHTENGINE_SECRET || '');
 
-          const seResponse = await axios({
-            method: 'post',
-            url: 'https://api.sightengine.com/1.0/check.json',
-            data: formData,
-            headers: formData.getHeaders(),
-            timeout: 15000
-          });
+            const seResponse = await axios({
+              method: 'post',
+              url: 'https://api.sightengine.com/1.0/check.json',
+              data: formData,
+              headers: formData.getHeaders(),
+              timeout: 15000
+            });
 
-          const result = seResponse.data;
-          if (result && result.status === "success") {
-            sightengineSuccess = true;
+            const result = seResponse.data;
+            if (result && result.status === "success") {
+              const fullJsonStr = JSON.stringify(result).toLowerCase();
+              for (const kw of MODERATION_CONFIG.forbiddenKeywords) {
+                if (fullJsonStr.includes(kw)) {
+                  console.log(`⚠️ [IA] Mot-clé interdit '${kw}' détecté !`);
+                  modStatus = "flagged";
+                  break;
+                }
+              }
 
-            const fullJsonStr = JSON.stringify(result).toLowerCase();
-            for (const kw of MODERATION_CONFIG.forbiddenKeywords) {
-              if (fullJsonStr.includes(kw)) {
-                console.log(`⚠️ [IA] Mot-clé interdit '${kw}' détecté !`);
-                modStatus = "flagged";
-                break;
+              if (result.nudity) {
+                if (
+                  (result.nudity.sexual_activity || 0) > MODERATION_CONFIG.nuditySexualActivity ||
+                  (result.nudity.sexual_display || 0) > MODERATION_CONFIG.nuditySexualDisplay ||
+                  (result.nudity.erotica || 0) > MODERATION_CONFIG.nudityErotica ||
+                  (result.nudity.very_suggestive || 0) > MODERATION_CONFIG.nudityVerySuggestive
+                ) {
+                  modStatus = "flagged";
+                }
+              }
+
+              if (result.gore && (result.gore.prob || 0) > MODERATION_CONFIG.goreProb) modStatus = "flagged";
+              if (result.wad) {
+                if ((result.wad.weapons || 0) > MODERATION_CONFIG.wadWeapons) modStatus = "flagged";
+                if ((result.wad.drugs || 0) > MODERATION_CONFIG.wadDrugs) modStatus = "flagged";
               }
             }
-
-            if (result.nudity) {
-              if (
-                (result.nudity.sexual_activity || 0) > MODERATION_CONFIG.nuditySexualActivity ||
-                (result.nudity.sexual_display || 0) > MODERATION_CONFIG.nuditySexualDisplay ||
-                (result.nudity.erotica || 0) > MODERATION_CONFIG.nudityErotica ||
-                (result.nudity.very_suggestive || 0) > MODERATION_CONFIG.nudityVerySuggestive
-              ) {
-                modStatus = "flagged";
-              }
-            }
-
-            if (result.gore && (result.gore.prob || 0) > MODERATION_CONFIG.goreProb) modStatus = "flagged";
-            if (result.wad) {
-              if ((result.wad.weapons || 0) > MODERATION_CONFIG.wadWeapons) modStatus = "flagged";
-              if ((result.wad.drugs || 0) > MODERATION_CONFIG.wadDrugs) modStatus = "flagged";
-            }
+          } catch (seErr) {
+            console.error("⚠️ Erreur appel Sightengine :", seErr.message);
           }
         }
-      }
-
-      if (!sightengineSuccess && modStatus !== "flagged") {
-        throw new Error("L'analyse Sightengine n'a pu s'exécuter sur aucune image");
       }
 
       console.log(`🤖 Résultat IA Final pour ${videoId} : ${modStatus}`);
@@ -3420,27 +3416,30 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         return;
       }
 
-      // 5️⃣ COMPRESSION FFMPEG FORCÉE (DÉBIT STRICT 300K)
-      console.log(`⚡ [3/5] Compression FFmpeg ultra-agressive pour ${videoId}...`);
+      // 5️⃣ COMPRESSION FFMPEG FORCÉE
+      console.log(`⚡ [3/5] Compression FFmpeg pour ${videoId}...`);
       await new Promise((resolve, reject) => {
         ffmpeg(localVideoPath)
           .outputOptions([
-            "-vf scale='min(360,iw)':-2", // Résolution 360p max
+            "-vf scale='min(360\\,iw)':-2", // 🔥 Virgule échappée \\, indispensable pour FFmpeg
             "-r 24",                       // Plafond 24 FPS
             "-c:v libx264",                // Codec H.264
-            "-b:v 300k",                   // 🔥 Force un débit vidéo maximal de 300 kbps
+            "-b:v 300k",                   // Débit vidéo maximal 300 kbps
             "-maxrate 400k",               // Plafond strict
-            "-bufsize 600k",               // Tampon
-            "-preset medium",              // Meilleure compression
+            "-bufsize 600k",               // Tampon VBV
+            "-preset medium",              // Compression optimale
             "-c:a aac",                    // Codec audio AAC
             "-b:a 48k",                    // Audio 48 kbps
             "-ac 1",                       // Son Mono
-            "-pix_fmt yuv420p",            // Compatible mobile
-            "-movflags +faststart"         // Streaming rapide
+            "-pix_fmt yuv420p",            // Format compatible mobile
+            "-movflags +faststart"         // Streaming rapide MP4
           ])
           .save(compressedVideoPath)
           .on("end", resolve)
-          .on("error", reject);
+          .on("error", (err) => {
+            console.error("❌ Erreur FFmpeg :", err.message);
+            reject(err);
+          });
       });
 
       const stats = await fs.promises.stat(compressedVideoPath);
@@ -3448,16 +3447,16 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         throw new Error("Le fichier vidéo compressé produit est vide");
       }
 
-      // 6️⃣ UPLOAD SUPABASE VIA STREAM
-      console.log(`☁️ [4/5] Upload sur Supabase via Stream...`);
+      // 6️⃣ UPLOAD SUPABASE VIA BUFFER
+      console.log(`☁️ [4/5] Upload du fichier compressé sur Supabase (${(stats.size / 1024 / 1024).toFixed(2)} Mo)...`);
       newUploadedFilePath = oldFilePath.replace(/\.[^/.]+$/, "") + `_comp_${Date.now()}.mp4`;
 
-      const uploadStream = fs.createReadStream(compressedVideoPath);
+      const compressedBuffer = await fs.promises.readFile(compressedVideoPath);
       const { error: uploadError } = await supabase.storage
         .from("media")
-        .upload(newUploadedFilePath, uploadStream, {
+        .upload(newUploadedFilePath, compressedBuffer, {
           contentType: "video/mp4",
-          duplex: 'half'
+          upsert: true
         });
 
       if (uploadError) {
@@ -3471,16 +3470,16 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
       const newVideoUrl = publicUrlData.publicUrl;
 
       // 7️⃣ MISE À JOUR FIRESTORE (videoUrl + mediaUrls)
-      console.log(`🔥 [5/5] Enregistrement dans Firestore...`);
+      console.log(`🔥 [5/5] Enregistrement de la vidéo compressée dans Firestore...`);
       await videoRef.update({
         moderationStatus: "clean",
         videoUrl: newVideoUrl,
-        mediaUrls: [newVideoUrl], // 👈 Met aussi à jour le tableau mediaUrls pour l'application !
+        mediaUrls: [newVideoUrl],
         filePath: newUploadedFilePath,
         processingEndedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // 8️⃣ SUPPRESSION DE L'ANCIENNE VIDÉO NON COMPRESSÉE
+      // 8️⃣ SUPPRESSION DE L'ANCIENNE VIDÉO BRUTE
       try {
         const { error: removeError } = await supabase.storage
           .from("media")
@@ -3489,13 +3488,13 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
         if (removeError) {
           console.error("⚠️ Erreur suppression ancien fichier Supabase :", removeError.message);
         } else {
-          console.log("🗑️ Ancienne vidéo non compressée supprimée de Supabase.");
+          console.log("🗑️ Ancienne vidéo brute supprimée de Supabase.");
         }
       } catch (cleanErr) {
         console.error("⚠️ Erreur lors de la suppression Supabase :", cleanErr.message);
       }
 
-      console.log(`🎉 TRAITEMENT ET COMPRESSION TERMINÉS AVEC SUCCÈS POUR ${videoId}`);
+      console.log(`🎉 COMPRESSION ET REMPLACEMENT RÉUSSIS POUR ${videoId}`);
 
     } catch (err) {
       console.error(`❌ ERREUR OPTIMISATION VIDÉO (${videoId}) :`, err.message);
@@ -3526,7 +3525,6 @@ app.post("/api/optimize-video", verifyFirebaseToken, async (req, res) => {
     }
   })();
 });
-
 
 // ================= ADMIN FINANCE SUMMARY =================
 

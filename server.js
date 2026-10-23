@@ -169,13 +169,16 @@ if (!ADMIN_UID) {
   throw new Error("ADMIN_UID manquant dans les variables d'environnement");
 }
 
-const MERCHANT_RENEWAL_AMOUNT = 250;
-const MERCHANT_RENEWAL_DAYS = 30;
-const MERCHANT_APPROVAL_REFERRER_REWARD = 500;
-const MERCHANT_APPROVAL_ADMIN_FEE = 250;
-const MERCHANT_RENEWAL_REFERRER_REWARD = 200;
-const MERCHANT_RENEWAL_ADMIN_FEE = 50;
-const MERCHANT_SALE_ADMIN_FEE = 10;
+
+
+// Accès marchand gratuit.
+const MERCHANT_RENEWAL_AMOUNT = 0;
+const MERCHANT_RENEWAL_DAYS = 0;
+
+// Conservée temporairement pour les anciennes routes de commande.
+// Elle sera remplacée avec le nouveau règlement sécurisé à 3 %.
+const MERCHANT_SALE_RATE_BPS = 300;
+
 
 const MONCASH_MODE = "sandbox"; // change en "live" plus tard
 
@@ -765,260 +768,6 @@ app.post("/api/check-and-clean-email", async (req, res) => {
 
 
 
-/* ================= WALLET WITHDRAW ================= */
-
-
-app.post("/api/requestWithdraw", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const uid = req.user.uid;
-    const {amount, pin} = req.body;
-
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-
-    if(!userSnap.exists){
-      return res.status(404).json({error:"User not found"});
-    }
-
-    const user = userSnap.data() || {};
-
-    if(user.suspended === true){
-      return res.status(403).json({error:"Compte suspendu"});
-    }
-
-    const isAdmin = uid === ADMIN_UID;
-    const withdrawLimit = isAdmin ? 80000 : 20000;
-
-    if(!user.withdrawNumber){
-      return res.status(400).json({error:"Numero de retrait non enregistré"});
-    }
-
-    const pending = await db.collection("walletTransactions")
-      .where("userId","==",uid)
-      .where("type","==","withdraw")
-      .where("status","==","pending")
-      .limit(1)
-      .get();
-
-    if(!pending.empty){
-      return res.status(400).json({error:"Un retrait est déjà en cours"});
-    }
-
-    if(!Number.isInteger(amount) || amount <= 0){
-      return res.status(400).json({error:"Montant invalide"});
-    }
-
-    const allowedWithdraw = [250,500,1000,2000,5000,10000,20000,80000];
-
-    if(!allowedWithdraw.includes(amount)){
-      return res.status(400).json({error:"Montant non autorisé"});
-    }
-
-    if(!user.security || !user.security.pinHash){
-      return res.status(400).json({error:"PIN non configuré"});
-    }
-
-    if(!/^\d{6}$/.test(pin || "")){
-      return res.status(400).json({error:"PIN invalide"});
-    }
-
-    const valid = await bcrypt.compare(pin, user.security.pinHash);
-
-    if(!valid){
-      return res.status(400).json({error:"PIN incorrect"});
-    }
-
-
-
-const today = getLocalDateString();
-let dailyTotal = Number(user.withdrawDailyTotal || 0);
-let lastReset = user.withdrawResetAt || "";
-
-if(lastReset !== today){
-  dailyTotal = 0;
-  lastReset = today;
-}
-
-if(dailyTotal + amount > withdrawLimit){
-  return res.status(400).json({error:`Limite journalière atteinte (${withdrawLimit} Gdes / jour)`});
-}
-
-const money = getMoneyState(user);
-
-if(amount > money.available){
-  return res.status(400).json({error:"Solde disponible insuffisant"});
-}
-
-    const reference = makeOrderId("WDR");
-    const txRef = db.collection("walletTransactions").doc();
-
-    await txRef.set({
-      userId: uid,
-      amount,
-      number: user.withdrawNumber,
-      method: "moncash",
-      type: "withdraw",
-      status: "pending",
-      providerReference: reference,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    try{
-      const payout = await moncashTransfer(
-        amount,
-        user.withdrawNumber,
-        `Retrait HaytiClips ${uid}`,
-        reference
-      );
-
-      const transfer = payout?.transfer;
-
-      if(!transfer || transfer.message !== "successful"){
-        await txRef.update({
-          status: "failed",
-          failedAt: admin.firestore.FieldValue.serverTimestamp(),
-          failReason: "Transfert MonCash échoué"
-        });
-
-        return res.status(500).json({error:"Retrait échoué"});
-      }
-
-      await db.runTransaction(async (t)=>{
-        const freshUserSnap = await t.get(userRef);
-
-        if(!freshUserSnap.exists){
-          throw new Error("Utilisateur introuvable");
-        }
-
-        const freshUser = freshUserSnap.data() || {};
-const { wallet, available } = getMoneyState(freshUser);
-
-if(amount > available){
-  throw new Error("Solde disponible insuffisant");
-}
-
-const newWallet = wallet - amount;
-
-
-
-t.update(userRef,{
-  wallet: newWallet,
-  withdrawDailyTotal: dailyTotal + amount,
-  withdrawResetAt: lastReset,
-  lastWithdrawRequest: Date.now()
-});
-
-        t.update(txRef,{
-          status: "completed",
-          completedAt: admin.firestore.FieldValue.serverTimestamp(),
-          providerTransactionId: transfer.transaction_id || null,
-          balanceAfter: newWallet
-        });
-
-
-
-
-
-// 🔥 ADMIN STATS - WITHDRAW
-const statsRef = db.collection("adminStats").doc("finance");
-
-await db.runTransaction(async (t) => {
-
-  const statsDoc = await t.get(statsRef);
-
-  let stats = statsDoc.exists ? statsDoc.data() : {
-    totalIn: 0,
-    totalOut: 0,
-    netTotal: 0,
-    transactionsCount: 0,
-    typeTotals: {}
-  };
-
-  const amountValue = amount;
-  const type = "withdraw";
-
-  if(!stats.typeTotals[type]){
-    stats.typeTotals[type] = { in:0, out:0, count:0 };
-  }
-
-  stats.totalOut += amountValue;
-  stats.transactionsCount += 1;
-  stats.typeTotals[type].out += amountValue;
-  stats.typeTotals[type].count += 1;
-  stats.netTotal = stats.totalIn - stats.totalOut;
-
-  t.set(statsRef, stats);
-
-
-});
-
-
-
-
-      });
-
-      return res.json({success:true, txId:txRef.id});
-
-    }catch(providerError){
-      console.log("WITHDRAW PROVIDER ERROR:", providerError.response?.data || providerError.message || providerError);
-
-      try{
-        const statusResponse = await moncashPrefundedTransactionStatus(reference);
-        const txStatus = statusResponse?.transStatus;
-
-        if(txStatus === "successful"){
-          await db.runTransaction(async (t)=>{
-            const freshUserSnap = await t.get(userRef);
-
-            if(!freshUserSnap.exists){
-              throw new Error("Utilisateur introuvable");
-            }
-
-            const freshUser = freshUserSnap.data() || {};
-const { wallet, available } = getMoneyState(freshUser);
-
-if(amount > available){
-  throw new Error("Solde disponible insuffisant");
-}
-
-const newWallet = wallet - amount;
-
-t.update(userRef,{
-  wallet: newWallet,
-  withdrawDailyTotal: dailyTotal + amount,
-  withdrawResetAt: lastReset,
-  lastWithdrawRequest: Date.now()
-});
-
-
-
-            t.update(txRef,{
-              status: "completed",
-              completedAt: admin.firestore.FieldValue.serverTimestamp(),
-              balanceAfter: newWallet
-            });
-          });
-
-          return res.json({success:true, txId:txRef.id});
-        }
-      }catch(statusErr){
-        console.log("WITHDRAW STATUS ERROR:", statusErr.response?.data || statusErr.message || statusErr);
-      }
-
-      await txRef.update({
-        status: "failed",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-        failReason: "Transfert MonCash échoué"
-      });
-
-      return res.status(500).json({error:"Retrait échoué"});
-    }
-
-  }catch(e){
-    console.log("WITHDRAW ERROR:", e.response?.data || e.message || e);
-    res.status(500).json({error:e.message});
-  }
-});
 
 /* ================= SAVE WITHDRAW NUMBER ================= */
 
@@ -1286,141 +1035,6 @@ app.get("/api/moncash/payment-return", async (req,res)=>{
 });
 
 
-app.post("/set-pin", verifyFirebaseToken, async (req,res)=>{
-  try{
-
-    const uid = req.user.uid;
-    const { pin } = req.body;
-
-
-if(!/^\d{6}$/.test(pin || "")){
-  return res.status(400).json({error:"PIN invalide"});
-}
-
-
-const userSnap = await db.collection("users").doc(uid).get();
-
-if(!userSnap.exists){
-  return res.status(404).json({error:"User not found"});
-}
-
-const userData = userSnap.data() || {};
-
-if(userData.suspended === true){
-  return res.status(403).json({error:"Compte suspendu"});
-}
-
-    // 🔐 HASH bcrypt
-    const hash = await bcrypt.hash(pin, 10);
-
-    await db.collection("users").doc(uid).update({
-      "security.enabled": true,
-      "security.pinHash": hash,
-      "security.createdAt": admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({success:true});
-
-  }catch(e){
-    console.log("SET PIN ERROR:", e);
-    res.status(500).json({error:e.message});
-  }
-});
-
-
-
-app.post("/check-pin", verifyFirebaseToken, async (req,res)=>{
-  try{
-
-    const uid = req.user.uid;
-    const { pin } = req.body;
- 
-if(!/^\d{6}$/.test(pin || "")){
-  return res.json({success:false});
-}
-     
-    const userSnap = await db.collection("users").doc(uid).get();
-
-    if(!userSnap.exists){
-      return res.json({success:false});
-    }
-
-    const user = userSnap.data();
-
-    const hash = user.security?.pinHash;
-
-    if(!hash){
-      return res.json({success:false});
-    }
-
-    // 🔐 comparaison bcrypt
-    const valid = await bcrypt.compare(pin, hash);
-
-    if(!valid){
-      return res.json({success:false});
-    }
-
-    // ✅ update dernière vérification
-    await db.collection("users").doc(uid).update({
-      "security.lastVerified": admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({success:true});
-
-  }catch(e){
-    console.log("CHECK PIN ERROR:", e);
-    res.status(500).json({success:false});
-  }
-});
-
-
-app.post("/remove-pin", verifyFirebaseToken, async (req,res)=>{
-  try{
-
-    const uid = req.user.uid;
-    const { pin } = req.body;
-
-if(!/^\d{6}$/.test(pin || "")){
-  return res.json({error:"PIN invalide"});
-}
-
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-
-    if(!userSnap.exists){
-      return res.json({error:"User not found"});
-    }
-
-    const user = userSnap.data();
-    const hash = user.security?.pinHash;
-
-if(user.suspended === true){
-  return res.status(403).json({error:"Compte suspendu"});
-}
-
-    if(!hash){
-      return res.json({error:"Aucun PIN"});
-    }
-
-    const valid = await bcrypt.compare(pin, hash);
-
-    if(!valid){
-      return res.json({error:"PIN incorrect"});
-    }
-
-    await userRef.update({
-      "security.enabled": false,
-      "security.pinHash": null,
-      "security.lastVerified": admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({success:true});
-
-  }catch(e){
-    console.log("REMOVE PIN ERROR:", e);
-    res.status(500).json({error:e.message});
-  }
-});
 
 
 function addDaysTimestamp(days) {
@@ -1557,8 +1171,8 @@ merchantLastRenewedAt: null,
 merchantRenewalAmount: MERCHANT_RENEWAL_AMOUNT,
 merchantRenewalDays: MERCHANT_RENEWAL_DAYS,
 merchantRenewalBlocked: false,
-      security: {
-          enabled: false
+merchantAccessModel: "free-v2",
+      security: { enabled: false
         },
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true }); 
@@ -1571,1263 +1185,3375 @@ merchantRenewalBlocked: false,
   }
 });
 
-app.post("/api/requestMerchantAccess", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const uid = req.user.uid;
-    const { shopName, productType, referralCode } = req.body;
-
-    if(
-      typeof shopName !== "string" ||
-      typeof productType !== "string" ||
-      typeof referralCode !== "string"
-    ){
-      return res.status(400).json({error:"Données invalides"});
-    }
-
-    const cleanShopName = shopName.trim();
-    const cleanProductType = productType.trim();
-    const cleanReferralCode = referralCode.trim().toUpperCase();
-
-    if(!cleanShopName || cleanShopName.length < 2 || cleanShopName.length > 60){
-      return res.status(400).json({error:"Nom de boutique invalide"});
-    }
-
-    if(!cleanProductType || cleanProductType.length < 2 || cleanProductType.length > 60){
-      return res.status(400).json({error:"Type de produits invalide"});
-    }
-
-    if(!cleanReferralCode){
-      return res.status(400).json({error:"Code parrain obligatoire"});
-    }
-
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-
-    if(!userSnap.exists){
-      return res.status(404).json({error:"Utilisateur introuvable"});
-    }
-
-    const userData = userSnap.data() || {};
-
-    if(userData.suspended === true){
-      return res.status(403).json({error:"Compte suspendu"});
-    }
-
-    if(userData.merchantStatus === "pending"){
-      return res.status(400).json({error:"Une demande est déjà en attente"});
-    }
-
-    if(userData.merchantStatus === "active"){
-      return res.status(400).json({error:"Compte marchand déjà actif"});
-    }
-
-    const refSnap = await db.collection("users")
-      .where("referralCode","==",cleanReferralCode)
-      .limit(1)
-      .get();
-
-    if(refSnap.empty){
-      return res.status(400).json({error:"Code parrain invalide"});
-    }
-
-    const refDoc = refSnap.docs[0];
-    const referrerUid = refDoc.id;
-    const referrerData = refDoc.data() || {};
-
-    if(referrerUid === uid){
-      return res.status(400).json({error:"Vous ne pouvez pas utiliser votre propre code"});
-    }
-
-    if(referrerData.canReferMerchant !== true){
-      return res.status(400).json({error:"Ce code parrain n’est pas autorisé"});
-    }
 
 
-const money = getMoneyState(userData);
+app.post(
+  "/api/requestMerchantAccess",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
 
-if(money.available < 750){
-  return res.status(400).json({error:"Solde disponible insuffisant"});
-}
+      const {
+        shopName,
+        productType,
+        email,
+        description,
+        requestKey
+      } = req.body;
 
-    const existingPending = await db.collection("merchantRequests")
-      .where("uid","==",uid)
-      .where("status","==","pending")
-      .limit(1)
-      .get();
-
-    if(!existingPending.empty){
-      return res.status(400).json({error:"Une demande est déjà en attente"});
-    }
-
-    const requestRef = db.collection("merchantRequests").doc();
-    const txRef = db.collection("walletTransactions").doc();
-
-    await db.runTransaction(async (t)=>{
-      const freshUserSnap = await t.get(userRef);
-
-      if(!freshUserSnap.exists){
-        throw new Error("Utilisateur introuvable");
+      if (
+        typeof shopName !== "string" ||
+        typeof productType !== "string" ||
+        typeof email !== "string" ||
+        typeof description !== "string" ||
+        typeof requestKey !== "string"
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Informations invalides"
+        });
       }
 
-      const freshUser = freshUserSnap.data() || {};
+      const cleanShopName = shopName.trim();
+      const cleanProductType = productType.trim();
+      const cleanEmail = email.trim().toLowerCase();
+      const cleanDescription = description.trim();
 
+      if (
+        cleanShopName.length < 2 ||
+        cleanShopName.length > 60
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Nom de boutique invalide"
+        });
+      }
 
-const { wallet, available } = getMoneyState(freshUser);
+      if (
+        cleanProductType.length < 2 ||
+        cleanProductType.length > 60
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Catégorie commerciale invalide"
+        });
+      }
 
-if(available < 750){
-  throw new Error("Solde disponible insuffisant");
-}
+      if (
+        cleanEmail.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Email invalide"
+        });
+      }
 
-const newWallet = wallet - 750;
-      t.update(userRef,{
-        wallet: newWallet,
-        merchantStatus: "pending",
-        merchantEnabled: false,
-        merchantShopName: cleanShopName,
-        merchantProductType: cleanProductType,
-        merchantReferrerUid: referrerUid
-      });
+      if (
+        cleanDescription.length < 5 ||
+        cleanDescription.length > 300
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "La description doit contenir entre 5 et 300 caractères"
+        });
+      }
 
-      t.set(requestRef,{
-        uid,
+      if (!/^[a-zA-Z0-9_-]{16,80}$/.test(requestKey)) {
+        return res.status(400).json({
+          success: false,
+          error: "Référence de demande invalide. Actualise la page."
+        });
+      }
+
+      const payload = {
         shopName: cleanShopName,
         productType: cleanProductType,
-        referralCode: cleanReferralCode,
-        referrerUid,
-        amountPaid: 750,
-        status: "pending",
-        reviewedBy: null,
-        reviewedAt: null,
-        rejectReason: "",
-        refundDone: false,
-        payoutDone: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      t.set(txRef,{
-        userId: uid,
-        type: "merchant_request_payment",
-        amount: 750,
-        status: "completed",
-        merchantRequestId: requestRef.id,
-        balanceAfter: newWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    return res.json({success:true});
-
-  }catch(e){
-    console.log("MERCHANT REQUEST ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-app.post("/api/approveMerchant", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const staffUid = req.user.uid;
-    const { requestId } = req.body;
-
-    const staffSnap = await db.collection("users").doc(staffUid).get();
-
-    if(!staffSnap.exists){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const staffData = staffSnap.data() || {};
-    const role = staffData.role || "";
-
-    if(role !== "admin" && role !== "merchant_manager"){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const requestRef = db.collection("merchantRequests").doc(requestId);
-    const requestSnap = await requestRef.get();
-
-    if(!requestSnap.exists){
-      return res.status(404).json({error:"Demande introuvable"});
-    }
-
-    const requestData = requestSnap.data() || {};
-
-    if(requestData.status !== "pending"){
-      return res.status(400).json({error:"Demande déjà traitée"});
-    }
-
-    const userRef = db.collection("users").doc(requestData.uid);
-    const referrerRef = db.collection("users").doc(requestData.referrerUid);
-    const adminRef = db.collection("users").doc(ADMIN_UID);
-
-    await db.runTransaction(async (t)=>{
-      const freshReq = await t.get(requestRef);
-      const userSnap = await t.get(userRef);
-      const referrerSnap = await t.get(referrerRef);
-      const adminSnap = await t.get(adminRef);
-
-      if(!freshReq.exists) throw new Error("Demande introuvable");
-      if(freshReq.data().status !== "pending") throw new Error("Demande déjà traitée");
-      if(!userSnap.exists) throw new Error("Utilisateur introuvable");
-      if(!referrerSnap.exists) throw new Error("Parrain introuvable");
-      if(!adminSnap.exists) throw new Error("Admin introuvable");
-
-      const referrerData = referrerSnap.data() || {};
-      const adminData = adminSnap.data() || {};
-
-const newReferrerWallet = Number(referrerData.wallet || 0) + MERCHANT_APPROVAL_REFERRER_REWARD;
-const newAdminWallet = Number(adminData.wallet || 0) + MERCHANT_APPROVAL_ADMIN_FEE;
-const newReferrerEarned = Number(referrerData.walletEarned || 0) + MERCHANT_APPROVAL_REFERRER_REWARD;
-const newAdminEarned = Number(adminData.walletEarned || 0) + MERCHANT_APPROVAL_ADMIN_FEE;
-const expiresAt = addDaysTimestamp(MERCHANT_RENEWAL_DAYS);
-
-
-t.update(userRef,{
-  merchantStatus: "active",
-  merchantEnabled: true,
-  merchantApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
-  merchantApprovedBy: staffUid,
-  merchantExpiresAt: expiresAt,
-  merchantLastRenewedAt: admin.firestore.FieldValue.serverTimestamp(),
-  merchantRenewalAmount: MERCHANT_RENEWAL_AMOUNT,
-  merchantRenewalDays: MERCHANT_RENEWAL_DAYS,
-  merchantRenewalBlocked: false
-});
-
-
-      t.update(referrerRef,{
-        wallet: newReferrerWallet,
-        walletEarned: newReferrerEarned
-      });
-
-      t.update(adminRef,{
-        wallet: newAdminWallet,
-        walletEarned: newAdminEarned
-      });
-
-      t.update(requestRef,{
-        status: "approved",
-        reviewedBy: staffUid,
-        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
-        payoutDone: true
-      });
-
-      const refTx = db.collection("walletTransactions").doc();
-      const adminTx = db.collection("walletTransactions").doc();
-
-      t.set(refTx,{
-        userId: requestData.referrerUid,
-        type: "merchant_referral_reward",
-amount: MERCHANT_APPROVAL_REFERRER_REWARD,
-        status: "completed",
-        merchantRequestId: requestId,
-        balanceAfter: newReferrerWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      t.set(adminTx,{
-        userId: ADMIN_UID,
-        type: "merchant_platform_fee",
-amount: MERCHANT_APPROVAL_ADMIN_FEE,
-        status: "completed",
-        merchantRequestId: requestId,
-        balanceAfter: newAdminWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    return res.json({success:true});
-
-  }catch(e){
-    console.log("APPROVE MERCHANT ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-app.post("/api/rejectMerchant", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const staffUid = req.user.uid;
-    const { requestId, rejectReason } = req.body;
-
-    const staffSnap = await db.collection("users").doc(staffUid).get();
-
-    if(!staffSnap.exists){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const staffData = staffSnap.data() || {};
-    const role = staffData.role || "";
-
-    if(role !== "admin" && role !== "merchant_manager"){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const requestRef = db.collection("merchantRequests").doc(requestId);
-    const requestSnap = await requestRef.get();
-
-    if(!requestSnap.exists){
-      return res.status(404).json({error:"Demande introuvable"});
-    }
-
-    const requestData = requestSnap.data() || {};
-
-    if(requestData.status !== "pending"){
-      return res.status(400).json({error:"Demande déjà traitée"});
-    }
-
-    const userRef = db.collection("users").doc(requestData.uid);
-
-    await db.runTransaction(async (t)=>{
-      const freshReq = await t.get(requestRef);
-      const userSnap = await t.get(userRef);
-
-      if(!freshReq.exists) throw new Error("Demande introuvable");
-      if(freshReq.data().status !== "pending") throw new Error("Demande déjà traitée");
-      if(!userSnap.exists) throw new Error("Utilisateur introuvable");
-
-      const userData = userSnap.data() || {};
-      const newWallet = Number(userData.wallet || 0) + 750;
-
-      t.update(userRef,{
-        wallet: newWallet,
-        merchantStatus: "rejected",
-        merchantEnabled: false
-      });
-
-      t.update(requestRef,{
-        status: "rejected",
-        reviewedBy: staffUid,
-        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
-        rejectReason: typeof rejectReason === "string" ? rejectReason.trim() : "",
-        refundDone: true
-      });
-
-      const refundTx = db.collection("walletTransactions").doc();
-
-      t.set(refundTx,{
-        userId: requestData.uid,
-        type: "merchant_request_refund",
-        amount: 750,
-        status: "completed",
-        merchantRequestId: requestId,
-        balanceAfter: newWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    return res.json({success:true});
-
-  }catch(e){
-    console.log("REJECT MERCHANT ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-app.post("/api/enableMerchantReferrer", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const adminUid = req.user.uid;
-    const { targetUid } = req.body;
-
-    if(typeof targetUid !== "string" || !targetUid.trim()){
-      return res.status(400).json({error:"Utilisateur cible invalide"});
-    }
-
-    const adminSnap = await db.collection("users").doc(adminUid).get();
-
-    if(!adminSnap.exists){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const adminData = adminSnap.data() || {};
-
-    if(adminData.role !== "admin"){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    if(targetUid === adminUid){
-      return res.status(400).json({error:"Impossible de modifier votre propre compte admin ici."});
-    }
-
-    const userRef = db.collection("users").doc(targetUid);
-
-    let finalCode = "";
-
-    await db.runTransaction(async (t)=>{
-      const userSnap = await t.get(userRef);
-
-      if(!userSnap.exists){
-        throw new Error("Utilisateur introuvable");
-      }
-
-      const userData = userSnap.data() || {};
-
-      finalCode = userData.referralCode || "";
-
-      if(!finalCode){
-        finalCode = await generateUniqueReferralCode();
-      }
-
-      t.update(userRef,{
-        canReferMerchant: true,
-        referralCode: finalCode
-      });
-    });
-
-    return res.json({
-      success:true,
-      referralCode: finalCode
-    });
-
-  }catch(e){
-    console.log("ENABLE MERCHANT REFERRER ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-app.post("/api/disableMerchantReferrer", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const adminUid = req.user.uid;
-    const { targetUid } = req.body;
-
-    if(typeof targetUid !== "string" || !targetUid.trim()){
-      return res.status(400).json({error:"Utilisateur cible invalide"});
-    }
-
-    const adminSnap = await db.collection("users").doc(adminUid).get();
-
-    if(!adminSnap.exists){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const adminData = adminSnap.data() || {};
-
-    if(adminData.role !== "admin"){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    if(targetUid === adminUid){
-      return res.status(400).json({error:"Impossible de modifier votre propre compte admin ici."});
-    }
-
-    const userRef = db.collection("users").doc(targetUid);
-    const userSnap = await userRef.get();
-
-    if(!userSnap.exists){
-      return res.status(404).json({error:"Utilisateur introuvable"});
-    }
-
-    await userRef.update({
-      canReferMerchant: false
-    });
-
-    return res.json({success:true});
-
-  }catch(e){
-    console.log("DISABLE MERCHANT REFERRER ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-
-
-// 🔥 NOUVELLE LOGIQUE DE SUPPRESSION
-app.post("/api/removeMerchantAccess", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const staffUid = req.user.uid;
-    const { targetUid, imagesToDelete } = req.body;
-
-    if(typeof targetUid !== "string" || !targetUid.trim()){
-      return res.status(400).json({error:"Utilisateur cible invalide"});
-    }
-
-    const staffSnap = await db.collection("users").doc(staffUid).get();
-
-    if(!staffSnap.exists){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const staffData = staffSnap.data() || {};
-    const role = staffData.role || "";
-
-    if(role !== "admin" && role !== "merchant_manager"){
-      return res.status(403).json({error:"Accès refusé"});
-    }
-
-    const userRef = db.collection("users").doc(targetUid);
-    const userSnap = await userRef.get();
-
-    if(!userSnap.exists){
-      return res.status(404).json({error:"Utilisateur introuvable"});
-    }
-
-    const userData = userSnap.data() || {};
-
-    if(userData.merchantStatus !== "active"){
-      return res.status(400).json({error:"Ce compte marchand n’est pas actif"});
-    }
-
-    // 1. Préparer la liste de toutes les images à supprimer (Produits + Logo Boutique)
-    let fileNames = [];
-
-    // Récupérer les images des produits (envoyées par le frontend)
-    if (imagesToDelete && Array.isArray(imagesToDelete)) {
-      imagesToDelete.forEach(url => {
-        if (typeof url === 'string') {
-          const urlParts = url.split('/media/');
-          if (urlParts.length > 1) fileNames.push(decodeURIComponent(urlParts[1]));
-        }
-      });
-    }
-
-    // Récupérer le logo de la boutique depuis Firestore pour le supprimer de Supabase
-    if (userData.merchantLogo && typeof userData.merchantLogo === 'string') {
-      const logoParts = userData.merchantLogo.split('/media/');
-      if (logoParts.length > 1) {
-        fileNames.push(decodeURIComponent(logoParts[1]));
-      }
-    }
-
-    // 2. Remettre le compte marchand TOTALEMENT à zéro dans Firestore
-    await userRef.update({
-      merchantStatus: "none",
-      merchantEnabled: false,
-      merchantApprovedAt: null,
-      merchantApprovedBy: null,
-      merchantExpiresAt: null,        // 🔥 Stoppe la date d'expiration pour bloquer le renouvèlement
-      merchantLastRenewedAt: null,    // 🔥 Efface la date de renouvellement
-      merchantRenewalBlocked: false,  // 🔥 Permet de refaire une VRAIE nouvelle demande plus tard
-      merchantShopName: "",           // 🔥 Efface le nom
-      merchantProductType: "",        // 🔥 Efface le type
-      merchantBio: "",                // 🔥 Efface la bio (si existante)
-      merchantLogo: null,             // 🔥 Efface le logo de la Base de Données
-      merchantReferrerUid: null       // 🔥 Efface le parrain associé
-    });
-
-    // 3. Supprimer physiquement de Supabase
-    if (fileNames.length > 0) {
-      try {
-        await supabase.storage.from('media').remove(fileNames);
-        console.log(`✅ ${fileNames.length} fichiers (produits + logo) supprimés de Supabase pour l'UID: ${targetUid}`);
-      } catch (err) {
-        console.error("❌ Erreur Supabase lors de la suppression :", err.message);
-      }
-    }
-
-    return res.json({success:true});
-
-  }catch(e){
-    console.log("REMOVE MERCHANT ACCESS ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-
-app.post("/api/merchant/buy-product", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const buyerUid = req.user.uid;
-    const {
-      productId,
-      quantity,
-      customerNom,
-      customerPrenom,
-      customerEmail,
-      customerPhone,
-      customerWhatsapp,
-      customerSexe,
-      customerDetails
-    } = req.body;
-
-    const qty = Number(quantity || 1);
-
-    if(!productId || !Number.isInteger(qty) || qty <= 0){
-      return res.status(400).json({error:"Données invalides"});
-    }
-
-    const buyerRef = db.collection("users").doc(buyerUid);
-    const productRef = db.collection("merchantProducts").doc(productId);
-
-    await db.runTransaction(async (t)=>{
-      const buyerSnap = await t.get(buyerRef);
-      const productSnap = await t.get(productRef);
-
-      if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
-      if(!productSnap.exists) throw new Error("Produit introuvable");
-
-      const buyer = buyerSnap.data() || {};
-      const product = productSnap.data() || {};
-
-      if(product.isActive !== true){
-        throw new Error("Produit inactif");
-      }
-
-      const merchantUid = product.merchantUid;
-      if(!merchantUid){
-        throw new Error("Marchand introuvable");
-      }
-
-      const merchantRef = db.collection("users").doc(merchantUid);
-      const merchantSnap = await t.get(merchantRef);
-
-      if(!merchantSnap.exists){
-        throw new Error("Marchand introuvable");
-      }
-
-      const merchant = merchantSnap.data() || {};
-
-      if(
-        merchant.merchantEnabled !== true ||
-        merchant.merchantStatus !== "active" ||
-        isMerchantBlocked(merchant)
-      ){
-        throw new Error("Cette boutique est temporairement indisponible");
-      }
-
-      const stock = Number(product.stock || 0);
-      if(stock < qty){
-        throw new Error("Stock insuffisant");
-      }
-
-      const total = Number(product.price || 0) * qty;
-
-
-const { wallet, walletLocked, available } = getMoneyState(buyer);
-
-if(available < total){
-  throw new Error("Solde disponible insuffisant");
-}
-
-const newWallet = wallet - total;
-const newLocked = walletLocked + total;
-
-      t.update(buyerRef,{
-        wallet: newWallet,
-        walletLocked: newLocked
-      });
-
-      t.update(productRef,{
-        stock: stock - qty
-      });
-
-      const orderRef = db.collection("merchantOrders").doc();
-
-      t.set(orderRef,{
-        buyerUid,
-        merchantUid,
-        productId,
-        productName: product.name || "Produit",
-        quantity: qty,
-        totalAmount: total,
-        status: "pending",
-        customerNom: String(customerNom || "").trim(),
-        customerPrenom: String(customerPrenom || "").trim(),
-        customerEmail: String(customerEmail || "").trim().toLowerCase(),
-        customerPhone: String(customerPhone || "").trim(),
-        customerWhatsapp: String(customerWhatsapp || "").trim(),
-        customerSexe: String(customerSexe || "").trim(),
-        customerDetails: String(customerDetails || "").trim(),
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const buyerTxRef = db.collection("walletTransactions").doc();
-      const merchantTxRef = db.collection("walletTransactions").doc();
-
-      t.set(buyerTxRef,{
-        userId: buyerUid,
-        type: "merchant_order_created",
-        amount: total,
-        status: "pending",
-        orderId: orderRef.id,
-        merchantUid,
-        productId,
-        productName: product.name || "Produit",
-        quantity: qty,
-        balanceAfter: newWallet,
-        walletLockedAfter: newLocked,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      t.set(merchantTxRef,{
-        userId: merchantUid,
-        type: "merchant_sale_pending",
-        amount: total,
-        status: "pending",
-        orderId: orderRef.id,
-        buyerId: buyerUid,
-        productId,
-        productName: product.name || "Produit",
-        quantity: qty,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    return res.json({success:true});
-  }catch(e){
-    console.log("BUY PRODUCT ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-
-
-app.post("/api/merchant/accept-order", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const merchantUid = req.user.uid;
-    const { orderId } = req.body;
-
-    const orderRef = db.collection("merchantOrders").doc(orderId);
-
-    await db.runTransaction(async (t)=>{
-      const orderSnap = await t.get(orderRef);
-      if(!orderSnap.exists) throw new Error("Commande introuvable");
-
-      const order = orderSnap.data() || {};
-
-      if(order.merchantUid !== merchantUid){
-        throw new Error("Accès refusé");
-      }
-
-      if(order.status !== "pending"){
-        throw new Error("Commande déjà traitée");
-      }
-
-      const merchantRef = db.collection("users").doc(merchantUid);
-      const buyerRef = db.collection("users").doc(order.buyerUid);
-      const adminRef = db.collection("users").doc(ADMIN_UID);
-      const statsRef = db.collection("adminStats").doc("finance"); // 👈 DÉCLARATION ICI
-
-      // 🔥 TOUTES LES LECTURES EN PREMIER 🔥
-      const merchantSnap = await t.get(merchantRef);
-      const buyerSnap = await t.get(buyerRef);
-      const adminSnap = await t.get(adminRef);
-      const statsDoc = await t.get(statsRef); // 👈 LECTURE DÉPLACÉE ICI EN HAUT
-
-      if(!merchantSnap.exists) throw new Error("Marchand introuvable");
-      if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
-      if(!adminSnap.exists) throw new Error("Admin introuvable");
-
-      const merchant = merchantSnap.data() || {};
-      const buyer = buyerSnap.data() || {};
-      const adminData = adminSnap.data() || {};
-
-      if(
-        merchant.merchantEnabled !== true ||
-        merchant.merchantStatus !== "active" ||
-        isMerchantBlocked(merchant)
-      ){
-        throw new Error("Accès marchand bloqué");
-      }
-
-      const buyerLocked = Number(buyer.walletLocked || 0);
-      const total = Number(order.totalAmount || 0);
-
-      if(buyerLocked < total){
-        throw new Error("Montant bloqué insuffisant");
-      }
-
-      const saleFee = Math.min(MERCHANT_SALE_ADMIN_FEE, total);
-      const merchantNet = total - saleFee;
-
-      const newBuyerLocked = buyerLocked - total;
-
-      let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
-      let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
-      let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
-      let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
-
-      // 🔥 TOUTES LES ÉCRITURES ENSUITE 🔥
-      t.update(buyerRef,{
-        walletLocked: newBuyerLocked
-      });
-
-      if(merchantUid === ADMIN_UID){
-        newMerchantWallet = Number(adminData.wallet || 0) + total;
-        newMerchantEarned = Number(adminData.walletEarned || 0) + total;
-        newAdminWallet = newMerchantWallet;
-        newAdminEarned = newMerchantEarned;
-
-        t.update(adminRef,{
-          wallet: newAdminWallet,
-          walletEarned: newAdminEarned
-        });
-      }else{
-        t.update(merchantRef,{
-          wallet: newMerchantWallet,
-          walletEarned: newMerchantEarned
-        });
-
-        t.update(adminRef,{
-          wallet: newAdminWallet,
-          walletEarned: newAdminEarned
-        });
-      }
-
-      t.update(orderRef,{
-        status: "accepted",
-        acceptedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const merchantTxRef = db.collection("walletTransactions").doc();
-      const adminTxRef = db.collection("walletTransactions").doc();
-      const buyerTxRef = db.collection("walletTransactions").doc();
-
-      t.set(merchantTxRef,{
-        userId: merchantUid,
-        type: "merchant_sale_received",
-        amount: merchantNet,
-        feeAmount: saleFee,
-        grossAmount: total,
-        status: "completed",
-        orderId,
-        buyerId: order.buyerUid,
-        productId: order.productId,
-        productName: order.productName || "Produit",
-        quantity: Number(order.quantity || 0),
-        balanceAfter: newMerchantWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      t.set(adminTxRef,{
-        userId: ADMIN_UID,
-        type: "merchant_sale_fee",
-        amount: saleFee,
-        status: "completed",
-        orderId,
-        merchantUid,
-        productId: order.productId,
-        productName: order.productName || "Produit",
-        balanceAfter: newAdminWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      // 🔥 MISE À JOUR ADMIN STATS (SANS FAIRE DE LECTURE ICI) 🔥
-      let stats = statsDoc.exists ? statsDoc.data() : {
-        totalIn: 0,
-        totalOut: 0,
-        netTotal: 0,
-        transactionsCount: 0,
-        typeTotals: {}
+        email: cleanEmail,
+        description: cleanDescription
       };
 
-      const amountValue = saleFee;
-      const type = "merchant_sale_fee";
+      const fingerprint = crypto
+        .createHash("sha256")
+        .update(JSON.stringify(payload))
+        .digest("hex");
 
-      if(!stats.typeTotals[type]){
-        stats.typeTotals[type] = { in:0, out:0, count:0 };
-      }
+      const operationId = crypto
+        .createHash("sha256")
+        .update(`merchant-request:${uid}:${requestKey}`)
+        .digest("hex");
 
-      stats.totalIn += amountValue;
-      stats.transactionsCount += 1;
-      stats.typeTotals[type].in += amountValue;
-      stats.typeTotals[type].count += 1;
-      stats.netTotal = stats.totalIn - stats.totalOut;
+      const userRef = db.collection("users").doc(uid);
 
-      t.set(statsRef, stats); // 👈 ÉCRITURE DES STATS
+      const operationRef = db
+        .collection("merchantOperations")
+        .doc(operationId);
 
-      t.set(buyerTxRef,{
-        userId: order.buyerUid,
-        type: "merchant_order_paid",
-        amount: total,
-        status: "completed",
-        orderId,
-        merchantUid,
-        productId: order.productId,
-        productName: order.productName || "Produit",
-        quantity: Number(order.quantity || 0),
-        balanceAfter: Number(buyer.wallet || 0),
-        walletLockedAfter: newBuyerLocked,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
+      const requestRef = db
+        .collection("merchantRequests")
+        .doc();
 
-    return res.json({success:true});
-  }catch(e){
-    console.log("ACCEPT ORDER ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
+      const result = await db.runTransaction(async (t) => {
+        const operationSnap = await t.get(operationRef);
 
+        if (operationSnap.exists) {
+          const previous = operationSnap.data();
 
-app.post("/api/merchant/reject-order", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const merchantUid = req.user.uid;
-    const { orderId } = req.body;
+          if (previous.fingerprint !== fingerprint) {
+            throw new Error(
+              "Cette référence correspond à une autre demande"
+            );
+          }
 
-    const orderRef = db.collection("merchantOrders").doc(orderId);
-
-    await db.runTransaction(async (t)=>{
-      const orderSnap = await t.get(orderRef);
-      if(!orderSnap.exists) throw new Error("Commande introuvable");
-
-      const order = orderSnap.data() || {};
-
-      if(order.merchantUid !== merchantUid){
-        throw new Error("Accès refusé");
-      }
-
-      if(order.status !== "pending"){
-        throw new Error("Commande déjà traitée");
-      }
-
-      const buyerRef = db.collection("users").doc(order.buyerUid);
-      const productRef = db.collection("merchantProducts").doc(order.productId);
-
-      const buyerSnap = await t.get(buyerRef);
-      const productSnap = await t.get(productRef);
-
-      if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
-
-      const buyer = buyerSnap.data() || {};
-      const total = Number(order.totalAmount || 0);
-      const qty = Number(order.quantity || 0);
-      const buyerWallet = Number(buyer.wallet || 0);
-      const buyerLocked = Number(buyer.walletLocked || 0);
-
-      const newBuyerWallet = buyerWallet + total;
-      const newBuyerLocked = Math.max(0, buyerLocked - total);
-
-      t.update(buyerRef,{
-        wallet: newBuyerWallet,
-        walletLocked: newBuyerLocked
-      });
-
-      if(productSnap.exists){
-        const product = productSnap.data() || {};
-        t.update(productRef,{
-          stock: Number(product.stock || 0) + qty
-        });
-      }
-
-      t.update(orderRef,{
-        status: "rejected",
-        rejectedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const buyerTxRef = db.collection("walletTransactions").doc();
-      const merchantTxRef = db.collection("walletTransactions").doc();
-
-      t.set(buyerTxRef,{
-        userId: order.buyerUid,
-        type: "merchant_order_refund",
-        amount: total,
-        status: "completed",
-        orderId,
-        merchantUid,
-        productId: order.productId,
-        productName: order.productName || "Produit",
-        quantity: qty,
-        balanceAfter: newBuyerWallet,
-        walletLockedAfter: newBuyerLocked,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      t.set(merchantTxRef,{
-        userId: merchantUid,
-        type: "merchant_sale_rejected",
-        amount: total,
-        status: "failed",
-        orderId,
-        buyerId: order.buyerUid,
-        productId: order.productId,
-        productName: order.productName || "Produit",
-        quantity: qty,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    return res.json({success:true});
-  }catch(e){
-    console.log("REJECT ORDER ERROR:", e);
-    return res.status(500).json({error:e.message});
-  }
-});
-
-
-
-app.post("/api/merchant/complete-order", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const merchantUid = req.user.uid;
-    const { orderId } = req.body;
-
-    const orderRef = db.collection("merchantOrders").doc(orderId);
-
-    await db.runTransaction(async (t)=>{
-      const orderSnap = await t.get(orderRef);
-
-      if(!orderSnap.exists){
-        throw new Error("Commande introuvable");
-      }
-
-      const order = orderSnap.data() || {};
-
-      if(order.merchantUid !== merchantUid){
-        throw new Error("Accès refusé");
-      }
-
-      if(order.status === "completed"){
-        throw new Error("Commande déjà terminée");
-      }
-
-      const merchantRef = db.collection("users").doc(merchantUid);
-      const buyerRef = db.collection("users").doc(order.buyerUid);
-      const adminRef = db.collection("users").doc(ADMIN_UID);
-      const statsRef = db.collection("adminStats").doc("finance"); // 👈 DÉCLARATION ICI
-
-      // 🔥 TOUTES LES LECTURES EN PREMIER 🔥
-      const merchantSnap = await t.get(merchantRef);
-      const buyerSnap = await t.get(buyerRef);
-      const adminSnap = await t.get(adminRef);
-      const statsDoc = await t.get(statsRef); // 👈 LECTURE DÉPLACÉE ICI EN HAUT
-
-      if(!merchantSnap.exists) throw new Error("Marchand introuvable");
-      if(!buyerSnap.exists) throw new Error("Acheteur introuvable");
-      if(!adminSnap.exists) throw new Error("Admin introuvable");
-
-      const merchant = merchantSnap.data() || {};
-      const buyer = buyerSnap.data() || {};
-      const adminData = adminSnap.data() || {};
-      const total = Number(order.totalAmount || 0);
-
-      if(
-        merchant.merchantEnabled !== true ||
-        merchant.merchantStatus !== "active" ||
-        isMerchantBlocked(merchant)
-      ){
-        throw new Error("Accès marchand bloqué");
-      }
-
-      if(order.status === "pending"){
-        const buyerLocked = Number(buyer.walletLocked || 0);
-
-        if(buyerLocked < total){
-          throw new Error("Montant bloqué insuffisant");
+          return previous.result;
         }
 
-        const saleFee = Math.min(MERCHANT_SALE_ADMIN_FEE, total);
-        const merchantNet = total - saleFee;
+        const userSnap = await t.get(userRef);
 
-        const newBuyerLocked = buyerLocked - total;
-
-        let newMerchantWallet = Number(merchant.wallet || 0) + merchantNet;
-        let newMerchantEarned = Number(merchant.walletEarned || 0) + merchantNet;
-        let newAdminWallet = Number(adminData.wallet || 0) + saleFee;
-        let newAdminEarned = Number(adminData.walletEarned || 0) + saleFee;
-
-        // 🔥 TOUTES LES ÉCRITURES ENSUITE 🔥
-        t.update(buyerRef,{
-          walletLocked: newBuyerLocked
-        });
-
-        if(merchantUid === ADMIN_UID){
-          newMerchantWallet = Number(adminData.wallet || 0) + total;
-          newMerchantEarned = Number(adminData.walletEarned || 0) + total;
-          newAdminWallet = newMerchantWallet;
-          newAdminEarned = newMerchantEarned;
-
-          t.update(adminRef,{
-            wallet: newAdminWallet,
-            walletEarned: newAdminEarned
-          });
-        }else{
-          t.update(merchantRef,{
-            wallet: newMerchantWallet,
-            walletEarned: newMerchantEarned
-          });
-
-          t.update(adminRef,{
-            wallet: newAdminWallet,
-            walletEarned: newAdminEarned
-          });
+        if (!userSnap.exists) {
+          throw new Error("Utilisateur introuvable");
         }
 
-        const merchantTxRef = db.collection("walletTransactions").doc();
-        const adminTxRef = db.collection("walletTransactions").doc();
-        const buyerTxRef = db.collection("walletTransactions").doc();
+        const user = userSnap.data() || {};
 
-        t.set(merchantTxRef,{
-          userId: merchantUid,
-          type: "merchant_sale_received",
-          amount: merchantNet,
-          feeAmount: saleFee,
-          grossAmount: total,
-          status: "completed",
-          orderId,
-          buyerId: order.buyerUid,
-          productId: order.productId,
-          productName: order.productName || "Produit",
-          quantity: Number(order.quantity || 0),
-          balanceAfter: newMerchantWallet,
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        if (user.suspended === true) {
+          throw new Error("Compte suspendu");
+        }
 
-        t.set(adminTxRef,{
-          userId: ADMIN_UID,
-          type: "merchant_sale_fee",
-          amount: saleFee,
-          status: "completed",
-          orderId,
-          merchantUid,
-          productId: order.productId,
-          productName: order.productName || "Produit",
-          balanceAfter: newAdminWallet,
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        if (
+          user.merchantEnabled === true ||
+          ["pending", "active", "suspended"].includes(
+            user.merchantStatus
+          )
+        ) {
+          throw new Error(
+            "Une boutique ou une demande existe déjà pour ce compte"
+          );
+        }
 
-        // 🔥 MISE À JOUR ADMIN STATS (SANS LECTURE ICI) 🔥
-        let stats = statsDoc.exists ? statsDoc.data() : {
-          totalIn: 0,
-          totalOut: 0,
-          netTotal: 0,
-          transactionsCount: 0,
-          typeTotals: {}
+        const lastRequestMs =
+          user.merchantRequestedAt?.toMillis?.() || 0;
+
+        if (
+          lastRequestMs &&
+          Date.now() - lastRequestMs < 60000
+        ) {
+          throw new Error(
+            "Attends une minute avant une nouvelle demande"
+          );
+        }
+
+        const pendingQuery = db
+          .collection("merchantRequests")
+          .where("uid", "==", uid)
+          .where("status", "==", "pending")
+          .limit(1);
+
+        const pendingSnap = await t.get(pendingQuery);
+
+        if (!pendingSnap.empty) {
+          throw new Error("Une demande est déjà en attente");
+        }
+
+        const response = {
+          success: true,
+          requestId: requestRef.id
         };
 
-        const amountValue = saleFee;
-        const type = "merchant_sale_fee";
-
-        if(!stats.typeTotals[type]){
-          stats.typeTotals[type] = { in:0, out:0, count:0 };
-        }
-
-        stats.totalIn += amountValue;
-        stats.transactionsCount += 1;
-        stats.typeTotals[type].in += amountValue;
-        stats.typeTotals[type].count += 1;
-        stats.netTotal = stats.totalIn - stats.totalOut;
-
-        t.set(statsRef, stats);
-
-        t.set(buyerTxRef,{
-          userId: order.buyerUid,
-          type: "merchant_order_paid",
-          amount: total,
-          status: "completed",
-          orderId,
-          merchantUid,
-          productId: order.productId,
-          productName: order.productName || "Produit",
-          quantity: Number(order.quantity || 0),
-          balanceAfter: Number(buyer.wallet || 0),
-          walletLockedAfter: newBuyerLocked,
+        t.create(requestRef, {
+          uid,
+          ...payload,
+          accessModel: "free-v2",
+          amountPaid: 0,
+          status: "pending",
+          reviewedBy: null,
+          reviewedAt: null,
+          rejectReason: "",
+          refundDone: false,
+          payoutDone: false,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.update(userRef, {
+          merchantStatus: "pending",
+          merchantEnabled: false,
+          merchantRequestId: requestRef.id,
+          merchantRequestedAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.create(operationRef, {
+          uid,
+          kind: "merchant-request",
+          fingerprint,
+          result: response,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return response;
+      });
+
+      return res.json(result);
+
+    } catch (error) {
+      console.error("MERCHANT REQUEST ERROR:", error.message);
+
+      return res.status(400).json({
+        success: false,
+        error: error.message || "Impossible d’envoyer la demande"
+      });
+    }
+  }
+);
+
+
+
+async function readLegacyMerchantRefund(t, requestId, requestData) {
+  if (
+    requestData.accessModel === "free-v2" &&
+    Number(requestData.amountPaid || 0) === 0
+  ) {
+    return 0;
+  }
+
+  const historyQuery = db
+    .collection("walletTransactions")
+    .where("merchantRequestId", "==", requestId)
+    .limit(51);
+
+  const historySnap = await t.get(historyQuery);
+
+  if (historySnap.size > 50) {
+    throw new Error(
+      "Historique de cette ancienne demande à vérifier manuellement"
+    );
+  }
+
+  let paidMinor = 0;
+  let refundedMinor = 0;
+
+  function toMinor(value) {
+    const amount = Number(value);
+    const minor = Math.round(amount * 100);
+
+    if (
+      !Number.isFinite(amount) ||
+      !Number.isSafeInteger(minor) ||
+      minor < 0 ||
+      Math.abs(minor / 100 - amount) > 0.0000001
+    ) {
+      throw new Error("Ancien montant financier incohérent");
+    }
+
+    return minor;
+  }
+
+  for (const document of historySnap.docs) {
+    const transaction = document.data();
+
+    if (
+      transaction.userId !== requestData.uid ||
+      transaction.status !== "completed"
+    ) {
+      continue;
+    }
+
+    if (transaction.type === "merchant_request_payment") {
+      paidMinor += toMinor(transaction.amount);
+    }
+
+    if (transaction.type === "merchant_request_refund") {
+      refundedMinor += toMinor(transaction.amount);
+    }
+  }
+
+  if (
+    Number(requestData.amountPaid || 0) > 0 &&
+    paidMinor === 0
+  ) {
+    throw new Error(
+      "Ancien paiement non vérifiable : examen manuel nécessaire"
+    );
+  }
+
+  if (refundedMinor > paidMinor) {
+    throw new Error(
+      "Les remboursements historiques dépassent le paiement vérifié"
+    );
+  }
+
+  return (paidMinor - refundedMinor) / 100;
+}
+
+
+
+app.post(
+  "/api/approveMerchant",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const staffUid = req.user.uid;
+      const requestId = req.body.requestId;
+
+      if (
+        typeof requestId !== "string" ||
+        !requestId.trim() ||
+        requestId.includes("/") ||
+        requestId.length > 128
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Identifiant de demande invalide"
         });
       }
 
-      t.update(orderRef,{
-        status: "completed",
-        completedAt: admin.firestore.FieldValue.serverTimestamp()
+      const requestRef = db
+        .collection("merchantRequests")
+        .doc(requestId.trim());
+
+      const staffRef = db.collection("users").doc(staffUid);
+
+      const result = await db.runTransaction(async (t) => {
+        const staffSnap = await t.get(staffRef);
+        const requestSnap = await t.get(requestRef);
+
+        const staff = staffSnap.data() || {};
+
+        if (
+          !staffSnap.exists ||
+          staff.suspended === true ||
+          !["admin", "merchant_manager"].includes(staff.role)
+        ) {
+          throw new Error("Accès refusé");
+        }
+
+        if (!requestSnap.exists) {
+          throw new Error("Demande introuvable");
+        }
+
+        const request = requestSnap.data();
+
+        if (request.status === "approved") {
+          return { alreadyProcessed: true };
+        }
+
+        if (request.status !== "pending") {
+          throw new Error("Cette demande a déjà été traitée");
+        }
+
+        const userRef = db.collection("users").doc(request.uid);
+        const userSnap = await t.get(userRef);
+
+        if (!userSnap.exists) {
+          throw new Error("Utilisateur introuvable");
+        }
+
+        const user = userSnap.data() || {};
+
+        if (user.suspended === true) {
+          throw new Error("Impossible d’activer un compte suspendu");
+        }
+
+        if (
+          user.merchantStatus === "suspended" ||
+          user.merchantEnabled === true
+        ) {
+          throw new Error(
+            "Ce compte possède déjà un accès ou une suspension à examiner"
+          );
+        }
+
+        const refundAmount = await readLegacyMerchantRefund(
+          t,
+          requestRef.id,
+          request
+        );
+
+        const fields = {
+          merchantStatus: "active",
+          merchantEnabled: true,
+          merchantAccessModel: "free-v2",
+          merchantShopName: request.shopName || "",
+          merchantProductType: request.productType || "",
+          merchantEmail: request.email || user.email || "",
+          merchantBio: request.description || user.merchantBio || "",
+          merchantApprovedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+          merchantApprovedBy: staffUid,
+          merchantRenewalBlocked: false,
+          merchantRenewalAmount: 0,
+          merchantRenewalDays: 0,
+          merchantExpiresAt: null,
+          merchantRejectReason: ""
+        };
+
+        if (refundAmount > 0) {
+          const wallet = Number(user.wallet || 0);
+
+          if (!Number.isFinite(wallet) || wallet < 0) {
+            throw new Error("Solde à vérifier avant remboursement");
+          }
+
+          const newWallet = Math.round(
+            (wallet + refundAmount) * 100
+          ) / 100;
+
+          fields.wallet = newWallet;
+
+          const refundRef = db.collection("walletTransactions")
+            .doc(`merchant_access_refund_${requestRef.id}`);
+
+          t.create(refundRef, {
+            userId: request.uid,
+            type: "merchant_request_refund",
+            amount: refundAmount,
+            status: "completed",
+            merchantRequestId: requestRef.id,
+            balanceAfter: newWallet,
+            description: "Passage gratuit d’une ancienne demande en attente",
+            createdAt:
+              admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+
+        t.update(userRef, fields);
+
+        t.update(requestRef, {
+          status: "approved",
+          accessModel: "free-v2",
+          reviewedBy: staffUid,
+          reviewedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+          verifiedLegacyRefund: refundAmount,
+          refundDone: refundAmount > 0 || request.refundDone === true,
+          payoutDone: false
+        });
+
+        t.create(db.collection("notifications").doc(), {
+          to: request.uid,
+          from: staffUid,
+          type: "merchant_approved",
+          message: "Ta boutique est approuvée. Ton accès marchand est gratuit.",
+          read: false,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.create(db.collection("merchantAuditLogs").doc(), {
+          actorUid: staffUid,
+          action: "merchant-approved",
+          targetUid: request.uid,
+          requestId: requestRef.id,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return {
+          alreadyProcessed: false,
+          uid: request.uid
+        };
       });
-    });
 
-    return res.json({success:true});
-  }catch(e){
-    console.log("COMPLETE ORDER ERROR:", e);
-    return res.status(500).json({error:e.message});
+      if (!result.alreadyProcessed) {
+        await sendPushNotification(
+          result.uid,
+          "Boutique approuvée",
+          "Ton Espace Marchand est activé gratuitement.",
+          { type: "merchant_approved" }
+        );
+      }
+
+      return res.json({ success: true });
+
+    } catch (error) {
+      console.error("APPROVE MERCHANT ERROR:", error.message);
+
+      return res.status(400).json({
+        success: false,
+        error: error.message || "Impossible d’approuver la demande"
+      });
+    }
   }
-});
+);
 
 
+app.post(
+  "/api/rejectMerchant",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const staffUid = req.user.uid;
+      const { requestId, rejectReason } = req.body;
 
-app.post("/api/merchant/renew-access", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const uid = req.user.uid;
-    const userRef = db.collection("users").doc(uid);
-    const adminRef = db.collection("users").doc(ADMIN_UID);
-
-    await db.runTransaction(async (t)=>{
-      const userSnap = await t.get(userRef);
-      const adminSnap = await t.get(adminRef);
-
-      if(!userSnap.exists) throw new Error("Utilisateur introuvable");
-      if(!adminSnap.exists) throw new Error("Admin introuvable");
-
-      const user = userSnap.data() || {};
-      const adminData = adminSnap.data() || {};
-
-      if(!user.merchantReferrerUid){
-        throw new Error("Parrain introuvable");
+      if (
+        typeof requestId !== "string" ||
+        !requestId.trim() ||
+        requestId.includes("/") ||
+        requestId.length > 128
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Identifiant de demande invalide"
+        });
       }
 
-      const referrerRef = db.collection("users").doc(user.merchantReferrerUid);
-      const referrerSnap = await t.get(referrerRef);
-
-      if(!referrerSnap.exists){
-        throw new Error("Parrain introuvable");
+      if (
+        typeof rejectReason !== "string" ||
+        rejectReason.trim().length < 5 ||
+        rejectReason.trim().length > 1000
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Indique un motif de refus entre 5 et 1000 caractères"
+        });
       }
 
-      const referrerData = referrerSnap.data() || {};
-const { wallet, available } = getMoneyState(user);
+      const reason = rejectReason.trim();
 
-if(available < MERCHANT_RENEWAL_AMOUNT){
-  throw new Error("Solde disponible insuffisant");
+      const requestRef = db.collection("merchantRequests")
+        .doc(requestId.trim());
+
+      const staffRef = db.collection("users").doc(staffUid);
+
+      const result = await db.runTransaction(async (t) => {
+        const staffSnap = await t.get(staffRef);
+        const requestSnap = await t.get(requestRef);
+
+        const staff = staffSnap.data() || {};
+
+        if (
+          !staffSnap.exists ||
+          staff.suspended === true ||
+          !["admin", "merchant_manager"].includes(staff.role)
+        ) {
+          throw new Error("Accès refusé");
+        }
+
+        if (!requestSnap.exists) {
+          throw new Error("Demande introuvable");
+        }
+
+        const request = requestSnap.data();
+
+        if (request.status === "rejected") {
+          return { alreadyProcessed: true };
+        }
+
+        if (request.status !== "pending") {
+          throw new Error("Cette demande a déjà été traitée");
+        }
+
+        const userRef = db.collection("users").doc(request.uid);
+        const userSnap = await t.get(userRef);
+
+        if (!userSnap.exists) {
+          throw new Error("Utilisateur introuvable");
+        }
+
+        const user = userSnap.data() || {};
+
+        if (
+          user.merchantEnabled === true ||
+          ["active", "suspended"].includes(user.merchantStatus)
+        ) {
+          throw new Error(
+            "L’état de cette boutique doit être examiné avant ce refus"
+          );
+        }
+
+        const refundAmount = await readLegacyMerchantRefund(
+          t,
+          requestRef.id,
+          request
+        );
+
+        const fields = {
+          merchantStatus: "rejected",
+          merchantEnabled: false,
+          merchantRejectReason: reason
+        };
+
+        if (refundAmount > 0) {
+          const wallet = Number(user.wallet || 0);
+
+          if (!Number.isFinite(wallet) || wallet < 0) {
+            throw new Error("Solde à vérifier avant remboursement");
+          }
+
+          const newWallet = Math.round(
+            (wallet + refundAmount) * 100
+          ) / 100;
+
+          fields.wallet = newWallet;
+
+          const refundRef = db.collection("walletTransactions")
+            .doc(`merchant_access_refund_${requestRef.id}`);
+
+          t.create(refundRef, {
+            userId: request.uid,
+            type: "merchant_request_refund",
+            amount: refundAmount,
+            status: "completed",
+            merchantRequestId: requestRef.id,
+            balanceAfter: newWallet,
+            description: "Remboursement vérifié d’une ancienne demande",
+            createdAt:
+              admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+
+        t.update(userRef, fields);
+
+        t.update(requestRef, {
+          status: "rejected",
+          accessModel: "free-v2",
+          reviewedBy: staffUid,
+          reviewedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+          rejectReason: reason,
+          verifiedLegacyRefund: refundAmount,
+          refundDone: refundAmount > 0 || request.refundDone === true
+        });
+
+        t.create(db.collection("notifications").doc(), {
+          to: request.uid,
+          from: staffUid,
+          type: "merchant_rejected",
+          message: `Ta demande a été refusée. Motif : ${reason}`,
+          read: false,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.create(db.collection("merchantAuditLogs").doc(), {
+          actorUid: staffUid,
+          action: "merchant-rejected",
+          targetUid: request.uid,
+          requestId: requestRef.id,
+          reason,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return {
+          alreadyProcessed: false,
+          uid: request.uid
+        };
+      });
+
+      if (!result.alreadyProcessed) {
+        await sendPushNotification(
+          result.uid,
+          "Demande marchand examinée",
+          `Ta demande a été refusée. Motif : ${reason}`,
+          { type: "merchant_rejected" }
+        );
+      }
+
+      return res.json({ success: true });
+
+    } catch (error) {
+      console.error("REJECT MERCHANT ERROR:", error.message);
+
+      return res.status(400).json({
+        success: false,
+        error: error.message || "Impossible de refuser la demande"
+      });
+    }
+  }
+);
+
+
+for (const route of [
+  "/api/enableMerchantReferrer",
+  "/api/disableMerchantReferrer"
+]) {
+  app.post(route, verifyFirebaseToken, (req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: "Le parrainage n’est plus nécessaire pour accéder à l’Espace Marchand.",
+      code: "MERCHANT_ACCESS_FREE"
+    });
+  });
 }
 
-const newUserWallet = wallet - MERCHANT_RENEWAL_AMOUNT;
 
-      const newReferrerWallet = Number(referrerData.wallet || 0) + MERCHANT_RENEWAL_REFERRER_REWARD;
-      const newReferrerEarned = Number(referrerData.walletEarned || 0) + MERCHANT_RENEWAL_REFERRER_REWARD;
-      const newAdminWallet = Number(adminData.wallet || 0) + MERCHANT_RENEWAL_ADMIN_FEE;
-      const newAdminEarned = Number(adminData.walletEarned || 0) + MERCHANT_RENEWAL_ADMIN_FEE;
-      const expiresAt = addDaysTimestamp(MERCHANT_RENEWAL_DAYS);
 
-      t.update(userRef,{
-        wallet: newUserWallet,
-        merchantEnabled: true,
-        merchantStatus: "active",
-        merchantRenewalBlocked: false,
-        merchantExpiresAt: expiresAt,
-        merchantLastRenewedAt: admin.firestore.FieldValue.serverTimestamp(),
-        merchantRenewalAmount: MERCHANT_RENEWAL_AMOUNT,
-        merchantRenewalDays: MERCHANT_RENEWAL_DAYS
+app.post(
+  "/api/removeMerchantAccess",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const staffUid = req.user.uid;
+      const { targetUid, reason } = req.body;
+
+      if (
+        typeof targetUid !== "string" ||
+        !targetUid.trim() ||
+        targetUid.includes("/") ||
+        targetUid.length > 128
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Utilisateur cible invalide"
+        });
+      }
+
+      if (
+        typeof reason !== "string" ||
+        reason.trim().length < 5 ||
+        reason.trim().length > 1000
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Un motif de suspension est obligatoire"
+        });
+      }
+
+      const cleanUid = targetUid.trim();
+      const cleanReason = reason.trim();
+
+      await db.runTransaction(async (t) => {
+        const staffRef = db.collection("users").doc(staffUid);
+        const userRef = db.collection("users").doc(cleanUid);
+
+        const staffSnap = await t.get(staffRef);
+        const userSnap = await t.get(userRef);
+
+        const staff = staffSnap.data() || {};
+
+        if (
+          !staffSnap.exists ||
+          staff.suspended === true ||
+          !["admin", "merchant_manager"].includes(staff.role)
+        ) {
+          throw new Error("Accès refusé");
+        }
+
+        if (!userSnap.exists) {
+          throw new Error("Marchand introuvable");
+        }
+
+        const merchant = userSnap.data() || {};
+
+        if (merchant.merchantStatus === "suspended") {
+          return;
+        }
+
+        if (merchant.merchantStatus !== "active") {
+          throw new Error("Cette boutique n’est pas active");
+        }
+
+        t.update(userRef, {
+          merchantStatus: "suspended",
+          merchantEnabled: false,
+          merchantSuspensionReason: cleanReason,
+          merchantSuspendedBy: staffUid,
+          merchantSuspendedAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.create(db.collection("notifications").doc(), {
+          to: cleanUid,
+          from: staffUid,
+          type: "merchant_suspended",
+          message: `Ta boutique est suspendue. Motif : ${cleanReason}`,
+          read: false,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        t.create(db.collection("merchantAuditLogs").doc(), {
+          actorUid: staffUid,
+          action: "merchant-suspended",
+          targetUid: cleanUid,
+          reason: cleanReason,
+          createdAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
       });
 
-      t.update(referrerRef,{
-        wallet: newReferrerWallet,
-        walletEarned: newReferrerEarned
+      return res.json({ success: true });
+
+    } catch (error) {
+      console.error("SUSPEND MERCHANT ERROR:", error.message);
+
+      return res.status(400).json({
+        success: false,
+        error: error.message || "Impossible de suspendre la boutique"
       });
+    }
+  }
+);
 
-      t.update(adminRef,{
-        wallet: newAdminWallet,
-        walletEarned: newAdminEarned
+
+const merchantOrdersV2 = (() => {
+  const C = (() => {
+    const crypto = require("node:crypto");
+    const TIMEZONE = "America/Port-au-Prince";
+    const RATE_BPS = MERCHANT_SALE_RATE_BPS;
+    const MAX_MONEY_MINOR = 100_000_000_000;
+
+    class MerchantError extends Error {
+      constructor(status, message, code = "MERCHANT_ERROR") {
+        super(message);
+        this.status = status;
+        this.code = code;
+      }
+    }
+
+    function fail(condition, message, status = 400, code) {
+      if (!condition) {
+        throw new MerchantError(status, message, code);
+      }
+    }
+
+    function text(value, name, max, min = 0) {
+      fail(typeof value === "string", `${name} invalide`);
+
+      const result = value.trim();
+
+      fail(
+        result.length >= min && result.length <= max,
+        `${name} invalide`
+      );
+
+      return result;
+    }
+
+    function id(value, name = "Identifiant") {
+      const result = text(value, name, 128, 1);
+
+      fail(
+        !/[\/\x00-\x1f]/.test(result) &&
+        ![".", ".."].includes(result),
+        `${name} invalide`
+      );
+
+      return result;
+    }
+
+    function minor(value, name = "Montant", zero = true) {
+      fail(
+        typeof value === "number" && Number.isFinite(value),
+        `${name} invalide`
+      );
+
+      const n = Math.round(value * 100);
+
+      fail(
+        Number.isSafeInteger(n) &&
+        n >= (zero ? 0 : 1) &&
+        n <= MAX_MONEY_MINOR &&
+        Math.abs(n / 100 - value) < 0.0000001,
+        `${name} invalide`
+      );
+
+      return n;
+    }
+
+    const htg = n => n / 100;
+
+    function feeFor(gross) {
+      fail(
+        Number.isSafeInteger(gross) &&
+        gross > 0 &&
+        gross <= MAX_MONEY_MINOR,
+        "Total invalide"
+      );
+
+      return Math.floor((gross * RATE_BPS + 5000) / 10000);
+    }
+
+    function money(user = {}, allowLegacy = false) {
+      const wallet = minor(user.wallet ?? 0, "Solde");
+      const locked = minor(user.walletLocked ?? 0, "Réservation");
+
+      fail(
+        allowLegacy || locked <= wallet,
+        "Solde à rapprocher par l’administration",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      return {
+        wallet,
+        locked,
+        available: Math.max(0, wallet - locked)
+      };
+    }
+
+    function active(user) {
+      return Boolean(
+        user &&
+        user.suspended !== true &&
+        user.merchantEnabled === true &&
+        user.merchantStatus === "active"
+      );
+    }
+
+    function staff(user, adminOnly = false) {
+      fail(
+        user &&
+        user.suspended !== true &&
+        (
+          user.role === "admin" ||
+          (!adminOnly && user.role === "merchant_manager")
+        ),
+        "Accès refusé",
+        403
+      );
+    }
+
+    const sha = value =>
+      crypto.createHash("sha256").update(value).digest("hex");
+
+    function operation(uid, kind, key, payload) {
+      fail(
+        typeof key === "string" &&
+        /^[a-zA-Z0-9_-]{16,80}$/.test(key),
+        "Actualise la page : référence de requête manquante",
+        400,
+        "REQUEST_KEY_REQUIRED"
+      );
+
+      return {
+        id: sha(`${uid}:${kind}:${key}`),
+        fingerprint: sha(JSON.stringify(payload))
+      };
+    }
+
+    function replay(snapshot, fingerprint) {
+      if (!snapshot.exists) return null;
+
+      fail(
+        snapshot.data().fingerprint === fingerprint,
+        "Cette référence est déjà utilisée pour une autre opération",
+        409
+      );
+
+      return snapshot.data().result;
+    }
+
+    function day(ms = Date.now()) {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: TIMEZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }).formatToParts(new Date(ms));
+
+      const p = Object.fromEntries(
+        parts.map(x => [x.type, x.value])
+      );
+
+      return `${p.year}-${p.month}-${p.day}`;
+    }
+
+    function asMs(value) {
+      if (value?.toMillis) return value.toMillis();
+      if (value?.toDate) return value.toDate().getTime();
+
+      return typeof value === "number" && Number.isFinite(value)
+        ? value
+        : 0;
+    }
+
+    function addDay(date, count) {
+      const d = new Date(`${date}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + count);
+      return d.toISOString().slice(0, 10);
+    }
+
+    function validDate(value) {
+      return (
+        typeof value === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+        !Number.isNaN(Date.parse(`${value}T12:00:00Z`)) &&
+        new Date(`${value}T12:00:00Z`)
+          .toISOString().startsWith(value)
+      );
+    }
+
+    function range(input = {}, now = Date.now()) {
+      const today = day(now);
+      let from;
+      let to;
+
+      switch (input.period || "30") {
+        case "today":
+          from = to = today;
+          break;
+        case "7":
+          from = addDay(today, -6);
+          to = today;
+          break;
+        case "30":
+          from = addDay(today, -29);
+          to = today;
+          break;
+        case "month":
+          from = `${today.slice(0, 7)}-01`;
+          to = today;
+          break;
+        case "year":
+          from = `${today.slice(0, 4)}-01-01`;
+          to = today;
+          break;
+        case "custom":
+          from = input.from;
+          to = input.to;
+          break;
+        default:
+          throw new MerchantError(400, "Période invalide");
+      }
+
+      fail(
+        validDate(from) &&
+        validDate(to) &&
+        from <= to &&
+        to <= today,
+        "Dates invalides"
+      );
+
+      fail(
+        Date.parse(`${to}T12:00:00Z`) -
+        Date.parse(`${from}T12:00:00Z`) <= 366 * 86400000,
+        "Période limitée à 366 jours"
+      );
+
+      return {
+        from,
+        to,
+        timezone: TIMEZONE,
+        generatedAt: now
+      };
+    }
+
+    function inRange(timestamp, r) {
+      const ms = asMs(timestamp);
+      if (!ms) return false;
+
+      const d = day(ms);
+
+      return d >= r.from && d <= r.to && ms <= r.generatedAt;
+    }
+
+    function contact(body = {}) {
+      const email = text(
+        body.customerEmail,
+        "Email",
+        254,
+        3
+      ).toLowerCase();
+
+      fail(
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
+        "Email invalide"
+      );
+
+      const phone = value => {
+        let p = text(
+          value,
+          "Téléphone",
+          30,
+          8
+        ).replace(/\D/g, "");
+
+        if (p.length === 8) p = `509${p}`;
+
+        fail(
+          /^509\d{8}$/.test(p),
+          "Téléphone haïtien invalide"
+        );
+
+        return p;
+      };
+
+      const sexe = text(
+        body.customerSexe || "",
+        "Sexe",
+        20
+      );
+
+      fail(
+        ["", "M", "F", "Autre"].includes(sexe),
+        "Valeur invalide"
+      );
+
+      return {
+        customerNom: text(body.customerNom, "Nom", 60, 1),
+        customerPrenom: text(body.customerPrenom, "Prénom", 60, 1),
+        customerEmail: email,
+        customerPhone: phone(body.customerPhone),
+        customerWhatsapp: phone(
+          body.customerWhatsapp || body.customerPhone
+        ),
+        customerSexe: sexe,
+        customerDetails: text(
+          body.customerDetails || "",
+          "Détails",
+          1000
+        )
+      };
+    }
+
+    function codecs(base64) {
+      const key = Buffer.from(base64 || "", "base64");
+
+      fail(
+        key.length === 32,
+        "MERCHANT_CODE_KEY doit contenir 32 octets encodés en base64",
+        503,
+        "CODE_KEY_MISSING"
+      );
+
+      function digest(orderId, code) {
+        return crypto.createHmac("sha256", key)
+          .update(`merchant-delivery:${orderId}:${code}`)
+          .digest("hex");
+      }
+
+      return {
+        create(orderId) {
+          const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+          let code = "";
+
+          for (let i = 0; i < 12; i++) {
+            code += alphabet[crypto.randomInt(alphabet.length)];
+          }
+
+          const iv = crypto.randomBytes(12);
+
+          const cipher = crypto.createCipheriv(
+            "aes-256-gcm",
+            key,
+            iv
+          );
+
+          cipher.setAAD(Buffer.from(orderId));
+
+          const encrypted = Buffer.concat([
+            cipher.update(code, "utf8"),
+            cipher.final()
+          ]);
+
+          return {
+            cipher: encrypted.toString("base64"),
+            iv: iv.toString("base64"),
+            tag: cipher.getAuthTag().toString("base64"),
+            hash: digest(orderId, code),
+            failedAttempts: 0,
+            lockUntilMs: 0,
+            usedAt: null,
+            keyVersion: 1
+          };
+        },
+
+        read(orderId, secret) {
+          const decipher = crypto.createDecipheriv(
+            "aes-256-gcm",
+            key,
+            Buffer.from(secret.iv, "base64")
+          );
+
+          decipher.setAAD(Buffer.from(orderId));
+
+          decipher.setAuthTag(
+            Buffer.from(secret.tag, "base64")
+          );
+
+          return Buffer.concat([
+            decipher.update(Buffer.from(secret.cipher, "base64")),
+            decipher.final()
+          ]).toString("utf8");
+        },
+
+        matches(orderId, input, secret) {
+          const normalized = String(input || "")
+            .toUpperCase()
+            .replace(/[\s-]/g, "");
+
+          if (
+            !/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/
+              .test(normalized)
+          ) {
+            return false;
+          }
+
+          const a = Buffer.from(
+            digest(orderId, normalized),
+            "hex"
+          );
+
+          const b = Buffer.from(secret.hash || "", "hex");
+
+          return (
+            a.length === b.length &&
+            crypto.timingSafeEqual(a, b)
+          );
+        }
+      };
+    }
+
+    function publicOrder(id, order) {
+      const out = { id };
+
+      for (const k of [
+        "buyerUid", "merchantUid", "productId",
+        "productName", "productImage", "quantity",
+        "unitPrice", "totalAmount", "feeAmount",
+        "merchantNet", "feeRateBps", "feePolicy",
+        "status", "fundsStatus", "accountingVersion",
+        "customerNom", "customerPrenom", "customerEmail",
+        "customerPhone", "customerWhatsapp", "customerSexe",
+        "customerDetails", "disputeId", "disputeDeadlineMs",
+        "deliveryTerms", "stockRestored", "requiresReconciliation"
+      ]) {
+        if (order[k] !== undefined) out[k] = order[k];
+      }
+
+      for (const k of [
+        "createdAt", "acceptedAt", "shippedAt",
+        "completedAt", "settledAt", "cancelledAt", "refundedAt"
+      ]) {
+        out[`${k}Ms`] = asMs(order[k]);
+      }
+
+      return out;
+    }
+
+    return {
+      MerchantError, fail, text, id, minor, htg,
+      feeFor, money, active, staff, operation, replay,
+      sha, day, asMs, inRange, range, contact,
+      codecs, publicOrder, RATE_BPS, TIMEZONE
+    };
+  })();
+
+  const auth = verifyFirebaseToken;
+
+  // Les écritures sont différées pour effectuer toutes les lectures
+  // Firestore avant les écritures de la transaction.
+  class Staged {
+    constructor(real) {
+      this.real = real;
+      this.writes = [];
+    }
+
+    get(ref) {
+      return this.real.get(ref);
+    }
+
+    set(...args) {
+      this.writes.push(["set", args]);
+    }
+
+    update(...args) {
+      this.writes.push(["update", args]);
+    }
+
+    create(...args) {
+      this.writes.push(["create", args]);
+    }
+
+    delete(...args) {
+      this.writes.push(["delete", args]);
+    }
+
+    flush() {
+      for (const [method, args] of this.writes) {
+        this.real[method](...args);
+      }
+    }
+  }
+
+  const timestamp = () =>
+    admin.firestore.FieldValue.serverTimestamp();
+
+  const ref = (name, key) => db.collection(name).doc(key);
+
+  const run = fn => db.runTransaction(async real => {
+    const tx = new Staged(real);
+    const out = await fn(tx);
+    tx.flush();
+    return out;
+  });
+
+  const maxRows = Number(
+    process.env.MERCHANT_REPORT_MAX_ROWS || 10000
+  );
+
+  const disputeHours = Number(
+    process.env.MERCHANT_DISPUTE_HOURS || 48
+  );
+
+  C.fail(
+    Number.isInteger(disputeHours) &&
+    disputeHours >= 1 &&
+    disputeHours <= 720,
+    "MERCHANT_DISPUTE_HOURS invalide",
+    503
+  );
+
+  const codeTools = () =>
+    C.codecs(process.env.MERCHANT_CODE_KEY);
+
+  const wrap = fn => async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (e) {
+      if (!(e instanceof C.MerchantError)) {
+        console.error("MERCHANT:", e.message);
+      }
+
+      if (!res.headersSent) {
+        res.status(e.status || 500).json({
+          success: false,
+          error: e.status
+            ? e.message
+            : "Erreur serveur. Vérifie le statut avant de réessayer.",
+          code: e.code || "SERVER_ERROR"
+        });
+      }
+    }
+  };
+
+  const getUser = async (tx, uid) => {
+    const s = await tx.get(ref("users", uid));
+    C.fail(s.exists, "Profil introuvable", 404);
+    return s.data();
+  };
+
+  const staffUser = async (tx, uid, onlyAdmin = false) => {
+    const u = await getUser(tx, uid);
+    C.staff(u, onlyAdmin);
+    return u;
+  };
+
+  const operationKey = req =>
+    req.headers["idempotency-key"] || req.body.requestKey;
+
+  function audit(tx, actorUid, action, target, details = {}) {
+    tx.create(db.collection("merchantAuditLogs").doc(), {
+      actorUid,
+      action,
+      target,
+      details,
+      createdAt: timestamp()
+    });
+  }
+
+  function notify(tx, uid, actor, type, message, key, extra = {}) {
+    tx.set(
+      ref("notifications", C.sha(`merchant:${key}`)),
+      {
+        to: uid,
+        from: actor,
+        type,
+        message,
+        read: false,
+        ...extra,
+        createdAt: timestamp()
+      }
+    );
+  }
+
+  async function finance(tx, type, incoming, outgoing) {
+    if (!tx.financeState) {
+      const statsRef = ref("adminStats", "finance");
+      const snapshot = await tx.get(statsRef);
+
+      tx.financeState = {
+        ref: statsRef,
+        data: snapshot.exists ? snapshot.data() : {}
+      };
+    }
+
+    const { ref: statsRef, data } = tx.financeState;
+
+    data.typeTotals = { ...(data.typeTotals || {}) };
+
+    const previous = data.typeTotals[type] || {};
+
+    data.typeTotals[type] = {
+      in: C.htg(C.minor(Number(previous.in || 0)) + incoming),
+      out: C.htg(C.minor(Number(previous.out || 0)) + outgoing),
+      count: Number(previous.count || 0) + 1
+    };
+
+    data.totalIn = C.htg(
+      C.minor(Number(data.totalIn || 0)) + incoming
+    );
+
+    data.totalOut = C.htg(
+      C.minor(Number(data.totalOut || 0)) + outgoing
+    );
+
+    data.netTotal = Number(
+      (data.totalIn - data.totalOut).toFixed(2)
+    );
+
+    data.transactionsCount =
+      Number(data.transactionsCount || 0) + 1;
+
+    tx.set(statsRef, data, { merge: true });
+  }
+
+  function accounting(tx) {
+    const accounts = new Map();
+
+    async function account(uid) {
+      if (!accounts.has(uid)) {
+        const u = await getUser(tx, uid);
+        const m = C.money(u, true);
+
+        accounts.set(uid, {
+          user: u,
+          ...m,
+          earned: C.minor(u.walletEarned ?? 0, "Revenus")
+        });
+      }
+
+      return accounts.get(uid);
+    }
+
+    return {
+      account,
+
+      async post(
+        uid,
+        walletDelta,
+        lockedDelta,
+        type,
+        amount,
+        eventId,
+        extra = {},
+        earnedDelta = 0
+      ) {
+        const a = await account(uid);
+
+        a.wallet += walletDelta;
+        a.locked += lockedDelta;
+        a.earned = Math.max(0, a.earned + earnedDelta);
+
+        C.fail(
+          Number.isSafeInteger(a.wallet) &&
+          a.wallet >= 0 &&
+          a.locked >= 0,
+          "Solde incohérent : rapprochement nécessaire",
+          409
+        );
+
+        tx.create(
+          ref(
+            "walletTransactions",
+            C.sha(`merchant-event:${eventId}:${uid}`)
+          ),
+          {
+            userId: uid,
+            type,
+            amount: C.htg(amount),
+            status: "completed",
+            accountingVersion: 2,
+            scope: "merchant",
+            walletDelta: C.htg(walletDelta),
+            lockedDelta: C.htg(lockedDelta),
+            balanceAfter: C.htg(a.wallet),
+            walletLockedAfter: C.htg(a.locked),
+            ...extra,
+            createdAt: timestamp()
+          }
+        );
+      },
+
+      flush() {
+        for (const [uid, a] of accounts) {
+          C.fail(
+            a.locked <= a.wallet,
+            "Réservations incohérentes : rapprochement nécessaire",
+            409,
+            "RECONCILIATION_REQUIRED"
+          );
+
+          tx.update(ref("users", uid), {
+            wallet: C.htg(a.wallet),
+            walletLocked: C.htg(a.locked),
+            walletEarned: C.htg(a.earned)
+          });
+        }
+      }
+    };
+  }
+
+  async function loadOrder(tx, orderId) {
+    const orderRef = ref(
+      "merchantOrders",
+      C.id(orderId, "Commande")
+    );
+
+    const s = await tx.get(orderRef);
+    C.fail(s.exists, "Commande introuvable", 404);
+
+    return { orderRef, order: s.data() };
+  }
+
+  // Conversion des anciennes commandes à partir des transactions réelles.
+  async function legacyOrder(tx, orderId, original, ledger) {
+    if (original.accountingVersion === 2) return original;
+
+    C.fail(
+      original.buyerUid !== original.merchantUid,
+      "Ancienne commande à vérifier manuellement",
+      409,
+      "RECONCILIATION_REQUIRED"
+    );
+
+    const q = await tx.get(
+      db.collection("walletTransactions")
+        .where("orderId", "==", orderId)
+        .limit(51)
+    );
+
+    C.fail(
+      q.size <= 50,
+      "Historique de commande à rapprocher",
+      409,
+      "RECONCILIATION_REQUIRED"
+    );
+
+    const rows = q.docs.map(s => s.data());
+    const gross = C.minor(original.totalAmount, "Total", false);
+
+    const received = rows.filter(x =>
+      x.type === "merchant_sale_received" &&
+      x.userId === original.merchantUid &&
+      x.status === "completed"
+    );
+
+    const paid = rows.filter(x =>
+      x.type === "merchant_order_paid" &&
+      x.userId === original.buyerUid &&
+      x.status === "completed"
+    );
+
+    let fee;
+    let state;
+
+    if (original.status === "pending") {
+      const created = rows.filter(x =>
+        x.type === "merchant_order_created" &&
+        x.userId === original.buyerUid &&
+        C.minor(x.amount) === gross
+      );
+
+      C.fail(
+        created.length === 1 &&
+        !received.length &&
+        !paid.length &&
+        !rows.some(x => x.type === "merchant_order_refund"),
+        "Ancienne réservation à rapprocher avant traitement",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      const buyer = await ledger.account(original.buyerUid);
+
+      C.fail(
+        buyer.locked >= gross,
+        "Ancien montant bloqué manquant",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      await ledger.post(
+        original.buyerUid,
+        gross,
+        0,
+        "merchant_legacy_reservation_adjustment",
+        gross,
+        `${orderId}:legacy-basis`,
+        {
+          orderId,
+          note: "Correction comptable d’une ancienne réservation"
+        }
+      );
+
+      // Ancien tarif de la version fournie : 10 HTG.
+      fee = Math.min(1000, gross);
+      state = "held";
+
+    } else if (["accepted", "completed"].includes(original.status)) {
+      C.fail(
+        received.length === 1 &&
+        paid.length === 1 &&
+        C.minor(paid[0].amount) === gross,
+        "Ancien règlement à rapprocher",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      fee = C.minor(received[0].feeAmount ?? 0);
+
+      C.fail(
+        C.minor(received[0].amount) + fee === gross,
+        "Ancien règlement incohérent",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      state = "settled";
+
+    } else {
+      throw new C.MerchantError(
+        409,
+        "Ancienne commande clôturée ou à rapprocher",
+        "LEGACY_CLOSED"
+      );
+    }
+
+    const changes = {
+      accountingVersion: 2,
+      migratedFromLegacy: true,
+      fundsStatus: state,
+      feeAmount: C.htg(fee),
+      merchantNet: C.htg(gross - fee),
+      feeRateBps: null,
+      feePolicy: "legacy-fixed",
+      migratedAt: timestamp()
+    };
+
+    if (state === "settled") {
+      changes.settledAt =
+        original.acceptedAt ||
+        original.completedAt ||
+        original.createdAt;
+    }
+
+    tx.update(ref("merchantOrders", orderId), {
+      ...changes,
+      deliveryCode: admin.firestore.FieldValue.delete()
+    });
+
+    if (original.status !== "completed") {
+      tx.set(ref("merchantOrderSecrets", orderId), {
+        ...codeTools().create(orderId),
+        createdAt: timestamp()
       });
+    }
 
-      const userTxRef = db.collection("walletTransactions").doc();
-      const refTxRef = db.collection("walletTransactions").doc();
-      const adminTxRef = db.collection("walletTransactions").doc();
+    return { ...original, ...changes };
+  }
 
-      t.set(userTxRef,{
-        userId: uid,
-        type: "merchant_renewal_payment",
-        amount: MERCHANT_RENEWAL_AMOUNT,
+  async function settle(tx, ledger, orderId, order, actor, source) {
+    if (order.fundsStatus === "settled") return false;
+
+    C.fail(
+      order.fundsStatus === "held",
+      "Fonds non disponibles pour ce règlement",
+      409
+    );
+
+    const gross = C.minor(order.totalAmount, "Total", false);
+    const fee = C.minor(order.feeAmount);
+    const net = C.minor(order.merchantNet);
+
+    C.fail(fee + net === gross, "Montants incohérents", 409);
+
+    const buyer = await ledger.account(order.buyerUid);
+
+    C.fail(
+      buyer.locked >= gross && buyer.wallet >= gross,
+      "Réservation insuffisante",
+      409,
+      "RECONCILIATION_REQUIRED"
+    );
+
+    await ledger.post(
+      order.buyerUid,
+      -gross,
+      -gross,
+      "merchant_order_paid",
+      gross,
+      `${orderId}:paid`,
+      { orderId, merchantUid: order.merchantUid }
+    );
+
+    await ledger.post(
+      order.merchantUid,
+      net,
+      0,
+      "merchant_sale_received",
+      net,
+      `${orderId}:sale`,
+      {
+        orderId,
+        buyerId: order.buyerUid,
+        grossAmount: C.htg(gross),
+        feeAmount: C.htg(fee),
+        productName: order.productName,
+        quantity: order.quantity,
+        heldDelta: -C.htg(net)
+      },
+      net
+    );
+
+    if (fee) {
+      await ledger.post(
+        ADMIN_UID,
+        fee,
+        0,
+        "merchant_sale_fee",
+        fee,
+        `${orderId}:fee`,
+        { orderId, merchantUid: order.merchantUid },
+        fee
+      );
+
+      await finance(tx, "merchant_sale_fee", fee, 0);
+    }
+
+    tx.update(ref("merchantOrders", orderId), {
+      fundsStatus: "settled",
+      settledAt: timestamp(),
+      settlementSource: source,
+      settledBy: actor
+    });
+
+    return true;
+  }
+
+  async function unreserve(tx, ledger, orderId, order, restock) {
+    C.fail(
+      order.fundsStatus === "held",
+      "Commande déjà réglée ou remboursée",
+      409
+    );
+
+    const gross = C.minor(order.totalAmount, "Total", false);
+    const buyer = await ledger.account(order.buyerUid);
+
+    C.fail(
+      buyer.locked >= gross,
+      "Réservation insuffisante",
+      409
+    );
+
+    await ledger.post(
+      order.buyerUid,
+      0,
+      -gross,
+      "merchant_order_unlocked",
+      gross,
+      `${orderId}:unlocked`,
+      { orderId }
+    );
+
+    tx.create(
+      ref(
+        "walletTransactions",
+        C.sha(`merchant-event:${orderId}:sale-cancelled`)
+      ),
+      {
+        userId: order.merchantUid,
+        type: "merchant_sale_cancelled",
+        scope: "merchant",
+        orderId,
+        amount: order.merchantNet,
+        walletDelta: 0,
+        lockedDelta: 0,
+        heldDelta: -order.merchantNet,
+        accountingVersion: 2,
         status: "completed",
-        balanceAfter: newUserWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        createdAt: timestamp()
+      }
+    );
+
+    if (restock && order.stockRestored !== true) {
+      const pRef = ref("merchantProducts", order.productId);
+      const p = await tx.get(pRef);
+
+      if (
+        p.exists &&
+        p.data().merchantUid === order.merchantUid
+      ) {
+        tx.update(pRef, {
+          stock: Number(p.data().stock || 0) + order.quantity,
+          version: Number(p.data().version || 0) + 1
+        });
+      }
+    }
+
+    tx.update(ref("merchantOrders", orderId), {
+      fundsStatus: "cancelled",
+      stockRestored: restock === true,
+      cancelledAt: timestamp()
+    });
+  }
+
+  // ACHAT : réservation du montant, sans versement au marchand.
+  app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
+    C.fail(
+      process.env.MERCHANT_CHECKOUT_PAUSED === "false",
+      "Achats temporairement en maintenance",
+      503,
+      "CHECKOUT_PAUSED"
+    );
+
+    const uid = req.user.uid;
+    const productId = C.id(req.body.productId);
+    const qty = req.body.quantity ?? 1;
+    const customer = C.contact(req.body);
+
+    C.fail(
+      Number.isInteger(qty) && qty > 0 && qty <= 1000,
+      "Quantité invalide"
+    );
+
+    const op = C.operation(
+      uid,
+      "buy",
+      operationKey(req),
+      { productId, qty, customer }
+    );
+
+    const opRef = ref("merchantOperations", op.id);
+    const orderRef = db.collection("merchantOrders").doc();
+    const secret = codeTools().create(orderRef.id);
+
+    const out = await run(async tx => {
+      const previous = C.replay(
+        await tx.get(opRef),
+        op.fingerprint
+      );
+
+      if (previous) return previous;
+
+      const buyer = await getUser(tx, uid);
+      C.fail(buyer.suspended !== true, "Compte suspendu", 403);
+
+      const pRef = ref("merchantProducts", productId);
+      const p = await tx.get(pRef);
+
+      C.fail(p.exists, "Produit introuvable", 404);
+
+      const product = p.data();
+
+      C.fail(
+        product.isActive === true && product.archived !== true,
+        "Produit indisponible",
+        409
+      );
+
+      C.fail(
+        product.merchantUid !== uid,
+        "Vous ne pouvez pas acheter vos propres produits"
+      );
+
+      const merchant = await getUser(tx, product.merchantUid);
+
+      C.fail(C.active(merchant), "Boutique inactive", 409);
+
+      C.fail(
+        Number.isInteger(product.stock) && product.stock >= qty,
+        "Stock insuffisant",
+        409
+      );
+
+      const unit = C.minor(product.price, "Prix", false);
+      const gross = unit * qty;
+      const fee = C.feeFor(gross);
+      const net = gross - fee;
+
+      const ledger = accounting(tx);
+      const a = await ledger.account(uid);
+
+      C.money(buyer);
+
+      C.fail(
+        a.available >= gross,
+        "Solde disponible insuffisant",
+        409
+      );
+
+      await ledger.post(
+        uid,
+        0,
+        gross,
+        "merchant_order_created",
+        gross,
+        `${orderRef.id}:reserved`,
+        {
+          orderId: orderRef.id,
+          merchantUid: product.merchantUid,
+          productId,
+          note: "Réservation sans débit du wallet"
+        }
+      );
+
+      tx.update(pRef, {
+        stock: product.stock - qty,
+        version: Number(product.version || 0) + 1
       });
 
-      t.set(refTxRef,{
-        userId: user.merchantReferrerUid,
-        type: "merchant_renewal_referral_reward",
-        amount: MERCHANT_RENEWAL_REFERRER_REWARD,
-        status: "completed",
-        merchantUid: uid,
-        balanceAfter: newReferrerWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      tx.create(orderRef, {
+        buyerUid: uid,
+        merchantUid: product.merchantUid,
+        productId,
+        productName: product.name,
+        productImage: product.images?.[0] || product.imageUrl || "",
+        quantity: qty,
+        unitPrice: C.htg(unit),
+        totalAmount: C.htg(gross),
+        feeAmount: C.htg(fee),
+        merchantNet: C.htg(net),
+        feeRateBps: C.RATE_BPS,
+        feePolicy: "percent-3",
+        accountingVersion: 2,
+        status: "pending",
+        fundsStatus: "held",
+        deliveryTerms: merchant.merchantDeliveryTerms ||
+          "À convenir avant remise du code",
+        stockRestored: false,
+        ...customer,
+        createdAt: timestamp()
       });
 
-      t.set(adminTxRef,{
-        userId: ADMIN_UID,
-        type: "merchant_renewal_admin_fee",
-        amount: MERCHANT_RENEWAL_ADMIN_FEE,
-        status: "completed",
-        merchantUid: uid,
-        balanceAfter: newAdminWallet,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      tx.create(ref("merchantOrderSecrets", orderRef.id), {
+        ...secret,
+        createdAt: timestamp()
+      });
+
+      tx.create(
+        ref(
+          "walletTransactions",
+          C.sha(`merchant-event:${orderRef.id}:sale-reserved`)
+        ),
+        {
+          userId: product.merchantUid,
+          type: "merchant_sale_reserved",
+          scope: "merchant",
+          orderId: orderRef.id,
+          amount: C.htg(net),
+          grossAmount: C.htg(gross),
+          feeAmount: C.htg(fee),
+          walletDelta: 0,
+          lockedDelta: 0,
+          heldDelta: C.htg(net),
+          accountingVersion: 2,
+          status: "completed",
+          createdAt: timestamp()
+        }
+      );
+
+      notify(
+        tx,
+        product.merchantUid,
+        uid,
+        "merchant_order",
+        "Nouvelle commande à préparer. Les fonds restent en attente.",
+        `order:${orderRef.id}`,
+        { orderId: orderRef.id }
+      );
+
+      const result = {
+        success: true,
+        orderId: orderRef.id,
+        totalAmount: C.htg(gross),
+        feeAmount: C.htg(fee)
+      };
+
+      tx.create(opRef, {
+        uid,
+        kind: "buy",
+        fingerprint: op.fingerprint,
+        result,
+        createdAt: timestamp()
+      });
+
+      ledger.flush();
+      return result;
+    });
+
+    res.json(out);
+  }));
+
+  app.get("/api/merchant/orders", auth, wrap(async (req, res) => {
+    const buyer = req.query.side === "buyer";
+
+    const query = db.collection("merchantOrders")
+      .where(
+        buyer ? "buyerUid" : "merchantUid",
+        "==",
+        req.user.uid
+      );
+
+    const q = await query.limit(maxRows + 1).get();
+
+    C.fail(
+      q.size <= maxRows,
+      "Historique trop important : pagination nécessaire",
+      413
+    );
+
+    const orders = q.docs
+      .map(x => C.publicOrder(x.id, x.data()))
+      .sort((a, b) => b.createdAtMs - a.createdAtMs);
+
+    const u = await ref("users", req.user.uid).get();
+
+    C.fail(u.exists, "Profil introuvable", 404);
+
+    C.fail(
+      u.data().suspended !== true || buyer,
+      "Compte suspendu",
+      403
+    );
+
+    res.json({ success: true, orders });
+  }));
+
+  app.get("/api/merchant/checkout-status", auth, wrap(async (req, res) => {
+    const key = C.text(req.query.requestKey, "Référence", 80, 16);
+
+    C.fail(/^[a-zA-Z0-9_-]+$/.test(key), "Référence invalide");
+
+    const snap = await ref(
+      "merchantOperations",
+      C.sha(`${req.user.uid}:buy:${key}`)
+    ).get();
+
+    res.json({
+      success: true,
+      found: snap.exists,
+      result: snap.exists ? snap.data().result : null
+    });
+  }));
+
+  app.get("/api/merchant/order/:orderId", auth, wrap(async (req, res) => {
+    const result = await run(async tx => {
+      const { order } = await loadOrder(tx, req.params.orderId);
+      const u = await getUser(tx, req.user.uid);
+
+      const participant = [
+        order.buyerUid,
+        order.merchantUid
+      ].includes(req.user.uid);
+
+      C.fail(
+        participant ||
+        (
+          u.suspended !== true &&
+          ["admin", "merchant_manager"].includes(u.role)
+        ),
+        "Accès refusé",
+        403
+      );
+
+      const history = await tx.get(
+        db.collection("walletTransactions")
+          .where("orderId", "==", req.params.orderId)
+          .limit(101)
+      );
+
+      C.fail(history.size <= 100, "Historique à rapprocher", 409);
+
+      return {
+        success: true,
+        order: C.publicOrder(req.params.orderId, order),
+
+        history: history.docs
+          .filter(s =>
+            !participant || s.data().userId === req.user.uid
+          )
+          .map(s => ({
+            id: s.id,
+            userId: s.data().userId,
+            type: s.data().type,
+            amount: s.data().amount,
+            status: s.data().status,
+            walletDelta: s.data().walletDelta ?? null,
+            atMs: C.asMs(s.data().createdAt)
+          }))
+      };
+    });
+
+    res.json(result);
+  }));
+
+  // Le code en clair n'est retourné qu'à l'acheteur.
+  app.get("/api/merchant/order-code/:orderId", auth, wrap(async (req, res) => {
+    const orderId = C.id(req.params.orderId);
+
+    const result = await run(async tx => {
+      const loaded = await loadOrder(tx, orderId);
+      let order = loaded.order;
+
+      C.fail(
+        order.buyerUid === req.user.uid,
+        "Code réservé à l’acheteur",
+        403
+      );
+
+      C.fail(
+        !["completed", "rejected", "cancelled", "refunded"]
+          .includes(order.status),
+        "Code indisponible pour une commande clôturée",
+        409
+      );
+
+      const ledger = accounting(tx);
+      const wasLegacy = order.accountingVersion !== 2;
+
+      order = await legacyOrder(tx, orderId, order, ledger);
+
+      let secret;
+
+      if (wasLegacy) {
+        secret = codeTools().create(orderId);
+
+        tx.set(ref("merchantOrderSecrets", orderId), {
+          ...secret,
+          createdAt: timestamp()
+        });
+
+      } else {
+        const s = await tx.get(
+          ref("merchantOrderSecrets", orderId)
+        );
+
+        C.fail(
+          s.exists,
+          "Code indisponible : contacte l’assistance",
+          409
+        );
+
+        secret = s.data();
+      }
+
+      C.fail(!secret.usedAt, "Code déjà utilisé", 409);
+
+      ledger.flush();
+
+      return {
+        success: true,
+        code: codeTools().read(orderId, secret),
+        warning:
+          "Communique ce code uniquement après réception et vérification du produit."
+      };
+    });
+
+    res.set("Cache-Control", "no-store").json(result);
+  }));
+
+  function transition(kind) {
+    return wrap(async (req, res) => {
+      const orderId = C.id(req.body.orderId);
+
+      const out = await run(async tx => {
+        const { orderRef, order: raw } = await loadOrder(tx, orderId);
+
+        C.fail(
+          raw.merchantUid === req.user.uid,
+          "Accès refusé",
+          403
+        );
+
+        const merchant = await getUser(tx, req.user.uid);
+
+        C.fail(C.active(merchant), "Boutique inactive", 403);
+
+        const ledger = accounting(tx);
+
+        const order = await legacyOrder(
+          tx,
+          orderId,
+          raw,
+          ledger
+        );
+
+        C.fail(
+          !order.disputeId,
+          "Un litige bloque cette action",
+          409
+        );
+
+        if (kind === "accept") {
+          C.fail(
+            order.status === "pending",
+            "Commande déjà traitée",
+            409
+          );
+
+          tx.update(orderRef, {
+            status: "accepted",
+            acceptedAt: timestamp()
+          });
+        }
+
+        if (kind === "ship") {
+          C.fail(
+            order.status === "accepted",
+            "Commande non prête pour livraison",
+            409
+          );
+
+          tx.update(orderRef, {
+            status: "shipping",
+            shippedAt: timestamp()
+          });
+        }
+
+        if (kind === "reject") {
+          C.fail(
+            order.status === "pending",
+            "Cette commande ne peut plus être refusée directement",
+            409
+          );
+
+          await unreserve(
+            tx,
+            ledger,
+            orderId,
+            order,
+            true
+          );
+
+          tx.update(orderRef, {
+            status: "rejected",
+            rejectedAt: timestamp()
+          });
+        }
+
+        if (kind === "complete") {
+          C.fail(
+            ["accepted", "shipping"].includes(order.status),
+            "Accepte la commande avant la livraison",
+            409
+          );
+
+          C.fail(
+            raw.accountingVersion === 2,
+            "L’acheteur doit ouvrir sa commande pour obtenir son code",
+            409,
+            "LEGACY_CODE_REQUIRED"
+          );
+
+          const sRef = ref("merchantOrderSecrets", orderId);
+          const s = await tx.get(sRef);
+
+          C.fail(s.exists, "Code indisponible", 409);
+
+          const secret = s.data();
+
+          C.fail(
+            !secret.usedAt,
+            "Livraison déjà validée",
+            409
+          );
+
+          C.fail(
+            Number(secret.lockUntilMs || 0) <= Date.now(),
+            "Trop de tentatives. Réessaie après 15 minutes.",
+            429
+          );
+
+          if (
+            !codeTools().matches(
+              orderId,
+              req.body.deliveryCode,
+              secret
+            )
+          ) {
+            const n = Number(secret.failedAttempts || 0) + 1;
+
+            tx.update(sRef, {
+              failedAttempts: n % 5,
+              lockUntilMs: n >= 5
+                ? Date.now() + 15 * 60000
+                : 0
+            });
+
+            ledger.flush();
+
+            return {
+              error: "Code incorrect",
+              status: 400
+            };
+          }
+
+          await settle(
+            tx,
+            ledger,
+            orderId,
+            order,
+            req.user.uid,
+            "buyer-delivery-code"
+          );
+
+          tx.update(sRef, {
+            usedAt: timestamp(),
+            cipher: admin.firestore.FieldValue.delete(),
+            iv: admin.firestore.FieldValue.delete(),
+            tag: admin.firestore.FieldValue.delete()
+          });
+
+          tx.update(orderRef, {
+            status: "completed",
+            completedAt: timestamp(),
+            disputeDeadlineMs:
+              Date.now() + disputeHours * 3600000
+          });
+
+          audit(
+            tx,
+            req.user.uid,
+            "delivery-confirmed",
+            orderId
+          );
+        }
+
+        const message =
+          kind === "complete"
+            ? "Livraison confirmée. Les fonds ont été libérés."
+            : kind === "reject"
+              ? "Commande refusée. La réservation a été annulée."
+              : kind === "ship"
+                ? "Votre commande est en livraison."
+                : "Votre commande a été acceptée et sera préparée.";
+
+        notify(
+          tx,
+          order.buyerUid,
+          req.user.uid,
+          "merchant_order_update",
+          message,
+          `${orderId}:${kind}`,
+          { orderId }
+        );
+
+        ledger.flush();
+
+        return { success: true };
+      });
+
+      if (out.error) {
+        return res.status(out.status).json({
+          success: false,
+          error: out.error
+        });
+      }
+
+      res.json(out);
+    });
+  }
+
+  app.post("/api/merchant/accept-order", auth, transition("accept"));
+  app.post("/api/merchant/ship-order", auth, transition("ship"));
+  app.post("/api/merchant/reject-order", auth, transition("reject"));
+  app.post("/api/merchant/complete-order", auth, transition("complete"));
+
+  app.post("/api/merchant/cancel-order", auth, wrap(async (req, res) => {
+    const orderId = C.id(req.body.orderId);
+
+    await run(async tx => {
+      const { orderRef, order: raw } = await loadOrder(tx, orderId);
+
+      C.fail(raw.buyerUid === req.user.uid, "Accès refusé", 403);
+
+      C.fail(
+        raw.status === "pending" && !raw.disputeId,
+        "Ouvre un litige pour cette commande",
+        409
+      );
+
+      const ledger = accounting(tx);
+      const order = await legacyOrder(tx, orderId, raw, ledger);
+
+      await unreserve(tx, ledger, orderId, order, true);
+
+      tx.update(orderRef, { status: "cancelled" });
+      ledger.flush();
+    });
+
+    res.json({ success: true });
+  }));
+
+  // LITIGES
+  app.post("/api/merchant/open-dispute", auth, wrap(async (req, res) => {
+    const orderId = C.id(req.body.orderId);
+    const reason = C.text(req.body.reason, "Motif", 1000, 10);
+    const disputeId = C.sha(`order-dispute:${orderId}`);
+
+    await run(async tx => {
+      const { orderRef, order: raw } = await loadOrder(tx, orderId);
+
+      C.fail(
+        raw.buyerUid === req.user.uid,
+        "Seul l’acheteur ouvre la réclamation",
+        403
+      );
+
+      const old = await tx.get(ref("merchantDisputes", disputeId));
+      if (old.exists) return;
+
+      C.fail(
+        !["rejected", "cancelled", "refunded"].includes(raw.status),
+        "Commande clôturée",
+        409
+      );
+
+      const ledger = accounting(tx);
+      const order = await legacyOrder(tx, orderId, raw, ledger);
+
+      if (order.status === "completed") {
+        C.fail(
+          Number(order.disputeDeadlineMs || 0) >= Date.now(),
+          "Délai de contestation expiré. Contacte l’assistance.",
+          409
+        );
+      }
+
+      tx.create(ref("merchantDisputes", disputeId), {
+        orderId,
+        buyerUid: order.buyerUid,
+        merchantUid: order.merchantUid,
+        previousStatus: order.status,
+        reason,
+        status: "open",
+        messages: [{
+          uid: req.user.uid,
+          text: reason,
+          atMs: Date.now()
+        }],
+        evidence: [],
+        createdAt: timestamp()
+      });
+
+      tx.update(orderRef, {
+        disputeId,
+        status: "disputed"
+      });
+
+      notify(
+        tx,
+        order.merchantUid,
+        req.user.uid,
+        "merchant_dispute",
+        "Une réclamation a été ouverte sur une commande.",
+        `dispute:${disputeId}`,
+        { orderId }
+      );
+
+      audit(tx, req.user.uid, "dispute-opened", orderId);
+      ledger.flush();
+    });
+
+    res.json({ success: true, disputeId });
+  }));
+
+  app.post("/api/merchant/request-review", auth, wrap(async (req, res) => {
+    const orderId = C.id(req.body.orderId);
+
+    const reason = C.text(
+      req.body.reason,
+      "Motif de l’examen",
+      1000,
+      10
+    );
+
+    const disputeId = C.sha(`order-dispute:${orderId}`);
+
+    await run(async tx => {
+      const { orderRef, order: raw } = await loadOrder(tx, orderId);
+
+      C.fail(raw.merchantUid === req.user.uid, "Accès refusé", 403);
+
+      const old = await tx.get(ref("merchantDisputes", disputeId));
+
+      C.fail(
+        !old.exists,
+        "Un dossier existe déjà pour cette commande",
+        409
+      );
+
+      C.fail(
+        ["accepted", "shipping"].includes(raw.status),
+        "Commande non admissible à cet examen",
+        409
+      );
+
+      const wait =
+        Number(process.env.MERCHANT_REVIEW_AFTER_HOURS || 72) *
+        3600000;
+
+      C.fail(
+        Date.now() - C.asMs(raw.acceptedAt || raw.createdAt) >= wait,
+        "Délai avant demande d’examen non atteint",
+        409
+      );
+
+      const ledger = accounting(tx);
+      const order = await legacyOrder(tx, orderId, raw, ledger);
+
+      tx.create(ref("merchantDisputes", disputeId), {
+        orderId,
+        buyerUid: order.buyerUid,
+        merchantUid: order.merchantUid,
+        previousStatus: order.status,
+        reason,
+        openedByMerchant: true,
+        status: "open",
+        messages: [{
+          uid: req.user.uid,
+          text: reason,
+          atMs: Date.now()
+        }],
+        evidence: [],
+        createdAt: timestamp()
+      });
+
+      tx.update(orderRef, {
+        disputeId,
+        status: "disputed"
+      });
+
+      audit(
+        tx,
+        req.user.uid,
+        "stalled-order-review",
+        orderId
+      );
+
+      notify(
+        tx,
+        order.buyerUid,
+        req.user.uid,
+        "merchant_dispute",
+        "Une commande sans confirmation a été soumise à examen. Aucun versement automatique.",
+        `stalled:${disputeId}`,
+        { orderId }
+      );
+
+      ledger.flush();
+    });
+
+    res.json({ success: true, disputeId });
+  }));
+
+  async function disputeAccess(tx, disputeId, uid) {
+    const dRef = ref("merchantDisputes", disputeId);
+    const d = await tx.get(dRef);
+
+    C.fail(d.exists, "Litige introuvable", 404);
+
+    const user = await getUser(tx, uid);
+    const data = d.data();
+
+    C.fail(
+      [data.buyerUid, data.merchantUid].includes(uid) ||
+      (
+        user.suspended !== true &&
+        ["admin", "merchant_manager"].includes(user.role)
+      ),
+      "Accès refusé",
+      403
+    );
+
+    return { dRef, data, user };
+  }
+
+  app.get("/api/merchant/disputes", auth, wrap(async (req, res) => {
+    const u = await ref("users", req.user.uid).get();
+
+    C.fail(u.exists, "Profil introuvable", 404);
+
+    const isStaff =
+      u.data().suspended !== true &&
+      ["admin", "merchant_manager"].includes(u.data().role);
+
+    let rows;
+
+    if (isStaff && req.query.staff === "1") {
+      const q = await db.collection("merchantDisputes")
+        .limit(maxRows + 1)
+        .get();
+
+      rows = q.docs;
+
+    } else {
+      const [a, b] = await Promise.all([
+        db.collection("merchantDisputes")
+          .where("buyerUid", "==", req.user.uid)
+          .get(),
+
+        db.collection("merchantDisputes")
+          .where("merchantUid", "==", req.user.uid)
+          .get()
+      ]);
+
+      rows = [...new Map(
+        [...a.docs, ...b.docs].map(d => [d.id, d])
+      ).values()];
+    }
+
+    C.fail(rows.length <= maxRows, "Historique trop important", 413);
+
+    res.json({
+      success: true,
+      disputes: rows
+        .map(x => ({
+          id: x.id,
+          ...x.data(),
+          createdAtMs: C.asMs(x.data().createdAt)
+        }))
+        .sort((a, b) => b.createdAtMs - a.createdAtMs)
+    });
+  }));
+
+  app.post("/api/merchant/dispute-message", auth, wrap(async (req, res) => {
+    const disputeId = C.id(req.body.disputeId);
+    const message = C.text(req.body.message, "Message", 2000, 2);
+
+    await run(async tx => {
+      const { dRef, data } = await disputeAccess(
+        tx,
+        disputeId,
+        req.user.uid
+      );
+
+      C.fail(data.status === "open", "Litige clôturé", 409);
+
+      C.fail(
+        (data.messages || []).length < 100,
+        "Limite de messages atteinte",
+        409
+      );
+
+      tx.update(dRef, {
+        messages: [
+          ...(data.messages || []),
+          {
+            uid: req.user.uid,
+            text: message,
+            atMs: Date.now()
+          }
+        ]
       });
     });
 
-    return res.json({success:true});
-  }catch(e){
-    console.log("MERCHANT RENEW ERROR:", e);
-    return res.status(500).json({error:e.message});
+    res.json({ success: true });
+  }));
+
+  app.post("/api/merchant/resolve-dispute", auth, wrap(async (req, res) => {
+    const disputeId = C.id(req.body.disputeId);
+    const decision = req.body.decision;
+
+    const reason = C.text(
+      req.body.reason,
+      "Décision motivée",
+      2000,
+      10
+    );
+
+    C.fail(
+      ["refund", "release"].includes(decision),
+      "Décision invalide"
+    );
+
+    await run(async tx => {
+      const staff = await staffUser(tx, req.user.uid);
+
+      const { dRef, data: d } = await disputeAccess(
+        tx,
+        disputeId,
+        req.user.uid
+      );
+
+      C.fail(d.status === "open", "Litige déjà traité", 409);
+
+      const { orderRef, order } = await loadOrder(tx, d.orderId);
+
+      C.fail(
+        order.accountingVersion === 2,
+        "Commande à rapprocher",
+        409
+      );
+
+      const ledger = accounting(tx);
+      const gross = C.minor(order.totalAmount);
+      const net = C.minor(order.merchantNet);
+      const fee = C.minor(order.feeAmount);
+
+      let funding = "none";
+
+      if (decision === "refund") {
+        if (order.fundsStatus === "held") {
+          await unreserve(
+            tx,
+            ledger,
+            d.orderId,
+            order,
+            req.body.restock === true
+          );
+
+          funding = "reservation";
+
+        } else {
+          C.fail(
+            order.fundsStatus === "settled",
+            "Remboursement impossible dans cet état",
+            409
+          );
+
+          if (req.body.funding === "platform") {
+            C.fail(
+              staff.role === "admin",
+              "Seul l’admin peut financer ce remboursement",
+              403
+            );
+
+            C.fail(
+              order.buyerUid !== ADMIN_UID,
+              "Utilise la reprise de la vente pour cet achat admin",
+              409
+            );
+
+            const a = await ledger.account(ADMIN_UID);
+
+            C.fail(
+              a.wallet - a.locked >= gross,
+              "Fonds plateforme insuffisants. Le dossier reste ouvert.",
+              409
+            );
+
+            await ledger.post(
+              ADMIN_UID,
+              -gross,
+              0,
+              "merchant_platform_refund",
+              gross,
+              `${d.orderId}:platform-refund`,
+              { orderId: d.orderId }
+            );
+
+            await finance(
+              tx,
+              "merchant_platform_refund",
+              0,
+              gross
+            );
+
+            funding = "platform";
+
+          } else {
+            // Fusion des mouvements si l’acheteur ou le marchand est l’admin.
+            const deltas = new Map();
+
+            for (const [uid, amount] of [
+              [order.merchantUid, -net],
+              [ADMIN_UID, -fee],
+              [order.buyerUid, gross]
+            ]) {
+              deltas.set(
+                uid,
+                (deltas.get(uid) || 0) + amount
+              );
+            }
+
+            for (const [uid, delta] of deltas) {
+              const a = await ledger.account(uid);
+
+              C.fail(
+                a.wallet - a.locked >= Math.max(0, -delta),
+                "Fonds retirés ou réservés. Financement admin nécessaire.",
+                409
+              );
+            }
+
+            await ledger.post(
+              order.buyerUid,
+              gross,
+              0,
+              "merchant_order_refund",
+              gross,
+              `${d.orderId}:buyer-refund`,
+              { orderId: d.orderId, funding: "sale" }
+            );
+
+            await ledger.post(
+              order.merchantUid,
+              -net,
+              0,
+              "merchant_sale_refunded",
+              net,
+              `${d.orderId}:seller-refund`,
+              {
+                orderId: d.orderId,
+                grossAmount: C.htg(gross)
+              },
+              -net
+            );
+
+            if (fee) {
+              await ledger.post(
+                ADMIN_UID,
+                -fee,
+                0,
+                "merchant_sale_fee_refunded",
+                fee,
+                `${d.orderId}:fee-refund`,
+                { orderId: d.orderId },
+                -fee
+              );
+
+              await finance(
+                tx,
+                "merchant_sale_fee_refunded",
+                0,
+                fee
+              );
+            }
+
+            funding = "sale";
+          }
+
+          if (funding === "platform") {
+            await ledger.post(
+              order.buyerUid,
+              gross,
+              0,
+              "merchant_order_refund",
+              gross,
+              `${d.orderId}:buyer-refund`,
+              { orderId: d.orderId, funding }
+            );
+          }
+
+          tx.update(orderRef, {
+            fundsStatus: "refunded",
+            refundedAt: timestamp(),
+            refundFunding: funding
+          });
+        }
+
+        tx.update(orderRef, { status: "refunded" });
+
+      } else {
+        await settle(
+          tx,
+          ledger,
+          d.orderId,
+          order,
+          req.user.uid,
+          "staff-dispute-decision"
+        );
+
+        tx.update(orderRef, {
+          status: "completed",
+          completedAt: order.completedAt || timestamp(),
+          disputeDeadlineMs: Date.now()
+        });
+
+        const secret = await tx.get(
+          ref("merchantOrderSecrets", d.orderId)
+        );
+
+        if (secret.exists) {
+          tx.update(secret.ref, {
+            usedAt: timestamp(),
+            cipher: admin.firestore.FieldValue.delete(),
+            iv: admin.firestore.FieldValue.delete(),
+            tag: admin.firestore.FieldValue.delete()
+          });
+        }
+      }
+
+      tx.update(orderRef, { disputeId: null });
+
+      tx.update(dRef, {
+        status: "resolved",
+        decision,
+        reasonDecision: reason,
+        funding,
+        resolvedBy: req.user.uid,
+        resolvedAt: timestamp()
+      });
+
+      for (const uid of [order.buyerUid, order.merchantUid]) {
+        notify(
+          tx,
+          uid,
+          req.user.uid,
+          "merchant_dispute_resolved",
+          `Réclamation traitée : ${reason}`,
+          `${disputeId}:resolved:${uid}`,
+          { orderId: d.orderId }
+        );
+      }
+
+      audit(
+        tx,
+        req.user.uid,
+        "dispute-resolved",
+        d.orderId,
+        { decision, reason, funding }
+      );
+
+      ledger.flush();
+    });
+
+    res.json({ success: true });
+  }));
+
+  // STOCKAGE PRIVÉ DES PREUVES
+  let privateBucketReady;
+
+  async function privateBucket() {
+    if (!privateBucketReady) {
+      privateBucketReady = (async () => {
+        const found = await supabase.storage.getBucket(
+          "merchant-private"
+        );
+
+        if (found.error) {
+          const made = await supabase.storage.createBucket(
+            "merchant-private",
+            {
+              public: false,
+              fileSizeLimit: 15 * 1024 * 1024
+            }
+          );
+
+          C.fail(
+            !made.error,
+            "Impossible de préparer le stockage privé",
+            503
+          );
+
+        } else {
+          C.fail(
+            found.data.public === false,
+            "Le bucket merchant-private doit être privé",
+            503
+          );
+        }
+      })().catch(e => {
+        privateBucketReady = null;
+        throw e;
+      });
+    }
+
+    await privateBucketReady;
   }
-});
+
+  function fileType(file, videoAllowed = false) {
+    C.fail(
+      file?.buffer?.length &&
+      file.buffer.length <= 15 * 1024 * 1024,
+      "Fichier manquant ou trop volumineux"
+    );
+
+    const b = file.buffer;
+
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+      return { ext: "jpg", mime: "image/jpeg" };
+    }
+
+    if (
+      b.subarray(0, 8).equals(
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+      )
+    ) {
+      return { ext: "png", mime: "image/png" };
+    }
+
+    if (
+      b.toString("ascii", 0, 4) === "RIFF" &&
+      b.toString("ascii", 8, 12) === "WEBP"
+    ) {
+      return { ext: "webp", mime: "image/webp" };
+    }
+
+    if (
+      videoAllowed &&
+      b.length > 12 &&
+      b.toString("ascii", 4, 8) === "ftyp"
+    ) {
+      return { ext: "mp4", mime: "video/mp4" };
+    }
+
+    throw new C.MerchantError(
+      400,
+      videoAllowed
+        ? "Utilise JPG, PNG, WebP ou une vidéo MP4"
+        : "Utilise une image JPG, PNG ou WebP"
+    );
+  }
+
+  if (uploadMemory) {
+    const oneFile = (field, fn) => (req, res) => {
+      uploadMemory.single(field)(req, res, error => {
+        if (error) {
+          return res.status(400).json({
+            success: false,
+            error: "Fichier trop volumineux ou invalide"
+          });
+        }
+
+        wrap(fn)(req, res);
+      });
+    };
+
+    app.post(
+      "/api/merchant/upload-image",
+      auth,
+      oneFile("file", async (req, res) => {
+        const user = await ref("users", req.user.uid).get();
+
+        C.fail(
+          user.exists && C.active(user.data()),
+          "Boutique inactive",
+          403
+        );
+
+        const kind = req.body.kind;
+
+        C.fail(
+          ["shop", "product"].includes(kind),
+          "Destination invalide"
+        );
+
+        const type = fileType(req.file);
+
+        const path =
+          `${kind === "shop" ? "shops" : "products"}/` +
+          `${req.user.uid}/${crypto.randomUUID()}.${type.ext}`;
+
+        const up = await supabase.storage
+          .from("media")
+          .upload(path, req.file.buffer, {
+            contentType: type.mime,
+            upsert: false
+          });
+
+        C.fail(!up.error, "Téléversement impossible", 503);
+
+        const url = supabase.storage
+          .from("media")
+          .getPublicUrl(path).data.publicUrl;
+
+        res.json({ success: true, url });
+      })
+    );
+
+    app.post(
+      "/api/merchant/dispute-evidence",
+      auth,
+      oneFile("file", async (req, res) => {
+        const disputeId = C.id(req.body.disputeId);
+        const type = fileType(req.file, true);
+
+        await run(async tx => {
+          const { data } = await disputeAccess(
+            tx,
+            disputeId,
+            req.user.uid
+          );
+
+          C.fail(
+            data.status === "open" &&
+            (data.evidence || []).length < 12,
+            "Litige fermé ou limite de preuves atteinte",
+            409
+          );
+        });
+
+        await privateBucket();
+
+        const fileId = crypto.randomUUID();
+
+        const storagePath =
+          `${disputeId}/${req.user.uid}/${fileId}.${type.ext}`;
+
+        const up = await supabase.storage
+          .from("merchant-private")
+          .upload(storagePath, req.file.buffer, {
+            contentType: type.mime,
+            upsert: false
+          });
+
+        C.fail(!up.error, "Envoi de la preuve impossible", 503);
+
+        try {
+          await run(async tx => {
+            const { dRef, data } = await disputeAccess(
+              tx,
+              disputeId,
+              req.user.uid
+            );
+
+            C.fail(
+              data.status === "open" &&
+              (data.evidence || []).length < 12,
+              "Litige fermé ou limite de preuves atteinte",
+              409
+            );
+
+            tx.update(dRef, {
+              evidence: [
+                ...(data.evidence || []),
+                {
+                  id: fileId,
+                  uid: req.user.uid,
+                  path: storagePath,
+                  mime: type.mime,
+                  atMs: Date.now()
+                }
+              ]
+            });
+          });
+
+        } catch (e) {
+          await supabase.storage
+            .from("merchant-private")
+            .remove([storagePath]);
+
+          throw e;
+        }
+
+        res.json({ success: true });
+      })
+    );
+  }
+
+  app.get(
+    "/api/merchant/dispute-evidence/:disputeId/:fileId",
+    auth,
+    wrap(async (req, res) => {
+      const disputeId = C.id(req.params.disputeId);
+      const fileId = C.id(req.params.fileId);
+
+      const evidence = await run(async tx => {
+        const { data } = await disputeAccess(
+          tx,
+          disputeId,
+          req.user.uid
+        );
+
+        const e = (data.evidence || []).find(
+          x => x.id === fileId
+        );
+
+        C.fail(e, "Preuve introuvable", 404);
+        return e;
+      });
+
+      await privateBucket();
+
+      const d = await supabase.storage
+        .from("merchant-private")
+        .download(evidence.path);
+
+      C.fail(!d.error, "Preuve indisponible", 503);
+
+      res.set("Cache-Control", "no-store")
+        .type(evidence.mime)
+        .send(Buffer.from(await d.data.arrayBuffer()));
+    })
+  );
+
+  // RÉACTIVATION : aucune suppression ni nouvelle facturation.
+  app.post("/api/merchant/reactivate", auth, wrap(async (req, res) => {
+    const uid = C.id(req.body.targetUid);
+
+    await run(async tx => {
+      await staffUser(tx, req.user.uid);
+      const u = await getUser(tx, uid);
+
+      C.fail(
+        u.suspended !== true &&
+        u.merchantStatus === "suspended" &&
+        u.merchantApprovedAt,
+        "Réactivation non autorisée",
+        409
+      );
+
+      tx.update(ref("users", uid), {
+        merchantStatus: "active",
+        merchantEnabled: true,
+        merchantAccessModel: "free-v2",
+        merchantRenewalBlocked: false,
+        merchantSuspensionReason: ""
+      });
+
+      notify(
+        tx,
+        uid,
+        req.user.uid,
+        "merchant_reactivated",
+        "Ta boutique est réactivée gratuitement.",
+        `reactivate:${uid}:${crypto.randomUUID()}`
+      );
+
+      audit(tx, req.user.uid, "reactivate", uid);
+    });
+
+    res.json({ success: true });
+  }));
+
+  // MIGRATION DES ANCIENNES COMMANDES : admin uniquement.
+  let migrationRunning = false;
+
+  app.post(
+    "/api/merchant/admin/migrate-orders",
+    auth,
+    wrap(async (req, res) => {
+      await run(tx => staffUser(tx, req.user.uid, true));
+
+      const apply = req.body.apply === true;
+
+      if (apply) {
+        C.fail(
+          process.env.MERCHANT_CHECKOUT_PAUSED === "true",
+          "Mettre les achats en maintenance avant la migration",
+          409
+        );
+
+        C.fail(
+          req.body.confirm === "MIGRATE_ORDERS_V2",
+          "Confirmation de migration manquante"
+        );
+      }
+
+      C.fail(
+        !migrationRunning,
+        "Une migration est déjà en cours",
+        409
+      );
+
+      migrationRunning = true;
+
+      try {
+        codeTools();
+
+        const snapshot = await db.collection("merchantOrders")
+          .where("status", "in", ["pending", "accepted"])
+          .limit(maxRows + 1)
+          .get();
+
+        C.fail(
+          snapshot.size <= maxRows,
+          "Migration trop volumineuse : traitement par lots nécessaire",
+          413
+        );
+
+        const selected = snapshot.docs
+          .filter(s => s.data().accountingVersion !== 2)
+          .sort((a, b) =>
+            Number(b.data().totalAmount || 0) -
+            Number(a.data().totalAmount || 0)
+          );
+
+        const result = {
+          success: true,
+          apply,
+          candidates: selected.length,
+          migrated: 0,
+          errors: []
+        };
+
+        if (apply) {
+          for (const snap of selected) {
+            try {
+              const changed = await run(async tx => {
+                await staffUser(tx, req.user.uid, true);
+
+                const fresh = await tx.get(snap.ref);
+
+                if (
+                  !fresh.exists ||
+                  fresh.data().accountingVersion === 2
+                ) {
+                  return false;
+                }
+
+                const ledger = accounting(tx);
+
+                await legacyOrder(
+                  tx,
+                  snap.id,
+                  fresh.data(),
+                  ledger
+                );
+
+                ledger.flush();
+
+                audit(
+                  tx,
+                  req.user.uid,
+                  "legacy-order-migrated",
+                  snap.id
+                );
+
+                return true;
+              });
+
+              if (changed) result.migrated++;
+
+            } catch (e) {
+              result.errors.push({
+                orderId: snap.id,
+                error: e.message
+              });
+            }
+          }
+        }
+
+        result.success = result.errors.length === 0;
+        res.json(result);
+
+      } finally {
+        migrationRunning = false;
+      }
+    })
+  );
+
+  return {
+    C,
+    Staged,
+    run,
+    accounting,
+    legacyOrder,
+    loadOrder,
+    settle,
+    unreserve,
+    getUser,
+    staffUser,
+    finance,
+    notify,
+    audit,
+    ref,
+    timestamp,
+    wrap,
+    maxRows
+  };
+})();
+
+
+app.post(
+  "/api/merchant/renew-access",
+  verifyFirebaseToken,
+  (req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: "L’accès marchand est gratuit. Aucun renouvellement payant n’est nécessaire.",
+      code: "MERCHANT_ACCESS_FREE"
+    });
+  }
+);
+
 
 
 /* ================= BLUE PAYMENT BACKEND ================= */
@@ -3632,266 +5358,2537 @@ app.get("/", (req, res) => {
 });
 
 
+(() => {
+  const { C, Staged } = merchantOrdersV2;
+  const auth = verifyFirebaseToken;
 
+  const stamp = () =>
+    admin.firestore.FieldValue.serverTimestamp();
 
+  const ref = (collection, id) =>
+    db.collection(collection).doc(id);
 
-/* =======================================================
-   TRANSFERTS MANUELS (RECHARGE & RETRAIT P2P)
-======================================================= */
+  const run = fn =>
+    db.runTransaction(async real => {
+      const t = new Staged(real);
+      const result = await fn(t);
+      t.flush();
+      return result;
+    });
 
-// 1. SOUMISSION PAR L'UTILISATEUR (Utilisation de uploadMemory !)
-app.post("/api/manual-transfer", verifyFirebaseToken, uploadMemory.single("receipt"), async (req, res) => {
-  try {
-    const uid = req.user.uid;
-    const body = req.body; 
-    const type = body.type;
+  const wrap = fn => async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (e) {
+      console.error(
+        "WALLET:",
+        e.status ? e.code || e.message : "Internal wallet failure"
+      );
 
-    const userRef = db.collection("users").doc(uid);
-
-    // --- LOGIQUE DE RETRAIT (AVEC SÉCURITÉ PIN) ---
-    if (type === "withdraw") {
-      const amountReq = Number(body.amountRequested);
-      const pin = body.pin; // 👈 1. Récupération du PIN
-
-      // Vérification rapide du format
-      if (!/^\d{6}$/.test(pin || "")) {
-        return res.status(400).json({ error: "Code PIN invalide. Il doit contenir 6 chiffres." });
+      if (!res.headersSent) {
+        res.status(e.status || 500).json({
+          success: false,
+          error: e.status
+            ? e.message
+            : "Erreur de traitement. Vérifie le statut avant de réessayer.",
+          code: e.code || "WALLET_ERROR"
+        });
       }
-      
-      await db.runTransaction(async (t) => {
-        const userSnap = await t.get(userRef);
-        if (!userSnap.exists) throw new Error("Utilisateur introuvable");
-        
-        const userData = userSnap.data();
+    }
+  };
 
-        // 👈 2. VÉRIFICATION BCRYPT DU PIN
-        if (!userData.security || !userData.security.pinHash) {
-          throw new Error("Veuillez d'abord configurer un code PIN dans vos paramètres de sécurité.");
+  async function user(t, uid) {
+    const snap = await t.get(ref("users", uid));
+    C.fail(snap.exists, "Utilisateur introuvable", 404);
+    return snap.data();
+  }
+
+  function enabled(data, kind) {
+    const blockedField =
+      kind === "withdraw" ? "withdrawBlocked" : "depositBlocked";
+
+    C.fail(
+      data.suspended !== true &&
+      data.frozenWallet !== true &&
+      data[blockedField] !== true,
+      "Opération bloquée sur ce compte",
+      403
+    );
+  }
+
+  async function pin(t, uid, data, value) {
+    C.fail(/^\d{6}$/.test(value || ""), "PIN invalide");
+
+    const privateRef = ref("userPrivate", uid);
+    const snap = await t.get(privateRef);
+    const privateData = snap.exists ? snap.data() : {};
+
+    const hash = privateData.pinHash || data.security?.pinHash;
+    C.fail(hash, "PIN non configuré");
+
+    C.fail(
+      Number(privateData.pinLockUntilMs || 0) <= Date.now(),
+      "Trop de tentatives. Réessaie après 15 minutes.",
+      429
+    );
+
+    if (!await bcrypt.compare(value, hash)) {
+      const count =
+        Number(privateData.pinFailedAttempts || 0) + 1;
+
+      t.set(privateRef, {
+        pinFailedAttempts: count % 5,
+        pinLockUntilMs:
+          count >= 5 ? Date.now() + 15 * 60000 : 0
+      }, { merge: true });
+
+      return false;
+    }
+
+    t.set(privateRef, {
+      pinFailedAttempts: 0,
+      pinLockUntilMs: 0
+    }, { merge: true });
+
+    return true;
+  }
+
+  function dailyLimit(data, uid, amount) {
+    const today = C.day();
+
+    const before = data.withdrawResetAt === today
+      ? C.minor(Number(data.withdrawDailyTotal || 0))
+      : 0;
+
+    const maximum = uid === ADMIN_UID ? 8000000 : 2000000;
+
+    C.fail(
+      before + amount <= maximum,
+      "Limite journalière de retrait atteinte",
+      409
+    );
+
+    return {
+      withdrawDailyTotal: C.htg(before + amount),
+      withdrawResetAt: today
+    };
+  }
+
+  function journal(
+    t, id, uid, type, amount, wallet, locked, extra = {}
+  ) {
+    t.create(ref("walletTransactions", id), {
+      userId: uid,
+      type,
+      amount: C.htg(amount),
+      status: "completed",
+      accountingVersion: 2,
+      scope: "wallet",
+      balanceAfter: C.htg(wallet),
+      walletLockedAfter: C.htg(locked),
+      ...extra,
+      createdAt: stamp()
+    });
+  }
+
+  async function finalizeAutomatic(txId, provider) {
+    return run(async t => {
+      const txRef = ref("walletTransactions", txId);
+      const snap = await t.get(txRef);
+
+      C.fail(snap.exists, "Retrait introuvable", 404);
+      const tx = snap.data();
+
+      if (tx.status === "completed") {
+        return { success: true, txId, status: "completed" };
+      }
+
+      C.fail(
+        tx.type === "withdraw" &&
+        tx.status === "pending" &&
+        tx.reservationSource === "server-v2",
+        "Retrait ancien à rapprocher manuellement",
+        409
+      );
+
+      const data = await user(t, tx.userId);
+      const money = C.money(data);
+      const amount = C.minor(tx.amount, "Montant", false);
+
+      C.fail(
+        money.locked >= amount && money.wallet >= amount,
+        "Réservation de retrait incohérente",
+        409
+      );
+
+      const statsRef = ref("adminStats", "finance");
+      const statsSnap = await t.get(statsRef);
+      const stats = statsSnap.exists ? statsSnap.data() : {};
+      const previous = stats.typeTotals?.withdraw || {};
+
+      const totalIn = C.minor(Number(stats.totalIn || 0));
+      const totalOut =
+        C.minor(Number(stats.totalOut || 0)) + amount;
+
+      t.set(statsRef, {
+        totalIn: C.htg(totalIn),
+        totalOut: C.htg(totalOut),
+        netTotal: C.htg(totalIn - totalOut),
+        transactionsCount:
+          Number(stats.transactionsCount || 0) + 1,
+        typeTotals: {
+          ...(stats.typeTotals || {}),
+          withdraw: {
+            in: Number(previous.in || 0),
+            out: C.htg(
+              C.minor(Number(previous.out || 0)) + amount
+            ),
+            count: Number(previous.count || 0) + 1
+          }
         }
-        
-        const isValidPin = await bcrypt.compare(pin, userData.security.pinHash);
-        if (!isValidPin) {
-          throw new Error("Code PIN incorrect. Opération refusée.");
-        }
+      }, { merge: true });
 
-        // 3. Suite si le PIN est bon
-        const wallet = Number(userData.wallet || 0);
-        const locked = Number(userData.walletLocked || 0);
-        const available = Math.max(0, wallet - locked);
-
-        if (available < amountReq) {
-          throw new Error("Solde disponible insuffisant");
-        }
-
-        // Bloquer l'argent
-        t.update(userRef, {
-          walletLocked: locked + amountReq
-        });
-
-        const transferRef = db.collection("manualTransfers").doc();
-        t.set(transferRef, {
-          userId: uid,
-          type: "withdraw",
-          method: body.method,
-          amountRequested: amountReq,
-          feeApplied: Number(body.feeApplied),
-          amountToReceive: Number(body.amountToReceive),
-          phone: body.phone,
-          accountName: body.accountName,
-          status: "pending",
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      t.update(ref("users", tx.userId), {
+        wallet: C.htg(money.wallet - amount),
+        walletLocked: C.htg(money.locked - amount),
+        pendingAutomaticWithdrawId: null,
+        lastWithdrawRequest: Date.now()
       });
 
-      return res.json({ success: true });
+      t.update(txRef, {
+        status: "completed",
+        providerState: "confirmed",
+        completedAt: stamp(),
+        providerTransactionId:
+          provider?.transfer?.transaction_id || null,
+        balanceAfter: C.htg(money.wallet - amount),
+        walletLockedAfter: C.htg(money.locked - amount),
+        walletDelta: -C.htg(amount),
+        lockedDelta: -C.htg(amount)
+      });
 
-    } 
-    // --- LOGIQUE DE RECHARGE (AVEC SUPABASE VIA MÉMOIRE) ---
-    else if (type === "deposit") {
-      let receiptUrl = "";
-      let uploadedFileName = "";
+      return { success: true, txId, status: "completed" };
+    });
+  }
 
-      if (req.file) {
-        // Nettoyer le nom du fichier pour éviter les bugs
-        const safeName = req.file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '');
-        const fileName = `${uid}_${Date.now()}_${safeName}`;
-        uploadedFileName = fileName;
+  async function reconcile(txId) {
+    const snap = await ref("walletTransactions", txId).get();
+    C.fail(snap.exists, "Retrait introuvable", 404);
 
-        // 👈 UPLOAD DIRECT DEPUIS LA MÉMOIRE (req.file.buffer)
-        const { data, error } = await supabase.storage
-          .from('media') 
+    const tx = snap.data();
+
+    if (tx.status === "completed") {
+      return { success: true, txId, status: "completed" };
+    }
+
+    C.fail(
+      tx.type === "withdraw" && tx.status === "pending",
+      "Ce retrait ne nécessite pas de vérification automatique",
+      409
+    );
+
+    let result;
+
+    try {
+      result = await moncashPrefundedTransactionStatus(
+        tx.providerReference
+      );
+    } catch {
+      // Une réponse inconnue ne débloque pas les fonds.
+    }
+
+    if (result?.transStatus === "successful") {
+      return finalizeAutomatic(txId, result);
+    }
+
+    await ref("walletTransactions", txId).update({
+      providerState: "reconciliation_required",
+      checkedAt: stamp()
+    });
+
+    return {
+      success: true,
+      txId,
+      status: "pending",
+      pending: true,
+      message:
+        "Vérification MonCash en cours. Les fonds restent réservés. Aucun second envoi n’a été effectué."
+    };
+  }
+
+  app.post("/api/requestWithdraw", auth, wrap(async (req, res) => {
+    const uid = req.user.uid;
+    const amount = C.minor(req.body.amount, "Montant", false);
+
+    C.fail(
+      Number.isInteger(req.body.amount) &&
+      [250, 500, 1000, 2000, 5000, 10000, 20000, 80000]
+        .includes(req.body.amount),
+      "Montant non autorisé"
+    );
+
+    const txRef = db.collection("walletTransactions").doc();
+    const reference = `WDR_${crypto.randomUUID()}`;
+
+    const result = await run(async t => {
+      const data = await user(t, uid);
+      enabled(data, "withdraw");
+
+      if (!await pin(t, uid, data, req.body.pin)) {
+        return { pinError: true };
+      }
+
+      C.fail(
+        /^509\d{8}$/.test(data.withdrawNumber || ""),
+        "Numéro de retrait non enregistré"
+      );
+
+      if (data.pendingAutomaticWithdrawId) {
+        const previous = await t.get(
+          ref("walletTransactions", data.pendingAutomaticWithdrawId)
+        );
+
+        if (previous.exists && previous.data().status === "pending") {
+          C.fail(
+            previous.data().amount === req.body.amount,
+            "Un autre retrait est déjà en cours",
+            409
+          );
+
+          return { txId: previous.id, created: false };
+        }
+      }
+
+      const oldPending = await t.get(
+        db.collection("walletTransactions")
+          .where("userId", "==", uid)
+          .where("type", "==", "withdraw")
+          .where("status", "==", "pending")
+          .limit(1)
+      );
+
+      C.fail(
+        oldPending.empty,
+        "Un retrait existant doit être rapproché avant une nouvelle demande",
+        409
+      );
+
+      const money = C.money(data);
+
+      C.fail(
+        money.available >= amount,
+        "Solde disponible insuffisant",
+        409
+      );
+
+      const daily = dailyLimit(data, uid, amount);
+
+      t.update(ref("users", uid), {
+        walletLocked: C.htg(money.locked + amount),
+        pendingAutomaticWithdrawId: txRef.id,
+        ...daily
+      });
+
+      t.create(txRef, {
+        userId: uid,
+        amount: C.htg(amount),
+        number: data.withdrawNumber,
+        method: "moncash",
+        type: "withdraw",
+        status: "pending",
+        reservationSource: "server-v2",
+        providerState: "reserved",
+        providerReference: reference,
+        reservedDay: daily.withdrawResetAt,
+        accountingVersion: 2,
+        scope: "wallet",
+        walletDelta: 0,
+        lockedDelta: 0,
+        createdAt: stamp()
+      });
+
+      journal(
+        t, `hold_${txRef.id}`, uid, "withdraw_reserved",
+        amount, money.wallet, money.locked + amount,
+        {
+          walletDelta: 0,
+          lockedDelta: C.htg(amount),
+          withdrawTxId: txRef.id
+        }
+      );
+
+      return {
+        txId: txRef.id,
+        created: true,
+        number: data.withdrawNumber
+      };
+    });
+
+    if (result.pinError) {
+      return res.status(400).json({
+        success: false,
+        error: "PIN incorrect"
+      });
+    }
+
+    if (!result.created) {
+      return res.json(await reconcile(result.txId));
+    }
+
+    let payout;
+
+    try {
+      payout = await moncashTransfer(
+        C.htg(amount),
+        result.number,
+        `Retrait HaytiClips ${uid}`,
+        reference
+      );
+    } catch {
+      // Ne jamais répéter un transfert dont la réponse est incertaine.
+    }
+
+    if (payout?.transfer?.message === "successful") {
+      return res.json(
+        await finalizeAutomatic(result.txId, payout)
+      );
+    }
+
+    const state = await reconcile(result.txId);
+    res.status(state.pending ? 202 : 200).json(state);
+  }));
+
+  app.get("/api/withdraw/status/:txId", auth, wrap(async (req, res) => {
+    const txId = C.id(req.params.txId);
+    const snap = await ref("walletTransactions", txId).get();
+
+    C.fail(
+      snap.exists && snap.data().type === "withdraw",
+      "Retrait introuvable",
+      404
+    );
+
+    if (snap.data().userId !== req.user.uid) {
+      const staff = await ref("users", req.user.uid).get();
+      C.staff(staff.exists ? staff.data() : null, true);
+    }
+
+    res.json(await reconcile(txId));
+  }));
+
+  app.get("/api/admin/wallet-reviews", auth, wrap(async (req, res) => {
+    const staff = await ref("users", req.user.uid).get();
+    C.staff(staff.exists ? staff.data() : null, true);
+
+    const [manual, automatic] = await Promise.all([
+      db.collection("manualTransfers")
+        .where("status", "==", "pending")
+        .limit(301)
+        .get(),
+      db.collection("walletTransactions")
+        .where("type", "==", "withdraw")
+        .where("status", "==", "pending")
+        .limit(301)
+        .get()
+    ]);
+
+    C.fail(
+      manual.size <= 300 && automatic.size <= 300,
+      "File de vérification trop importante : lecture paginée nécessaire",
+      413
+    );
+
+    res.json({
+      success: true,
+      manual: manual.docs.map(s => {
+        const x = s.data();
+
+        return {
+          id: s.id,
+          userId: x.userId,
+          type: x.type,
+          amount: x.amount ?? x.amountRequested,
+          amountToReceive: x.amountToReceive ?? null,
+          feeApplied: x.feeApplied ?? null,
+          phone: x.phone || "",
+          receiptUrl: x.receiptUrl || "",
+          legacy: x.source !== "server-v2",
+          legacyReviewed: !!x.legacyReviewedBy,
+          atMs: C.asMs(x.createdAt)
+        };
+      }),
+      automatic: automatic.docs.map(s => {
+        const x = s.data();
+
+        return {
+          id: s.id,
+          userId: x.userId,
+          amount: x.amount,
+          number: x.number,
+          legacy: x.reservationSource !== "server-v2",
+          state: x.providerState || "unknown",
+          atMs: C.asMs(x.createdAt)
+        };
+      })
+    });
+  }));
+
+  app.post("/api/admin/resolve-withdraw", auth, wrap(async (req, res) => {
+    const txId = C.id(req.body.txId);
+    const reason = C.text(
+      req.body.reason,
+      "Preuve de non-paiement vérifiée",
+      2000,
+      15
+    );
+
+    C.fail(
+      req.body.confirmedNotPaid === true,
+      "Vérifie le non-paiement dans MonCash avant de débloquer"
+    );
+
+    const staff = await ref("users", req.user.uid).get();
+    C.staff(staff.exists ? staff.data() : null, true);
+
+    const top = await ref("walletTransactions", txId).get();
+    C.fail(top.exists, "Retrait introuvable", 404);
+
+    let provider;
+
+    try {
+      provider = await moncashPrefundedTransactionStatus(
+        top.data().providerReference
+      );
+    } catch {
+      // Le contrôle manuel documenté reste obligatoire.
+    }
+
+    C.fail(
+      provider?.transStatus !== "successful",
+      "MonCash confirme le paiement : rapproche le retrait au lieu de débloquer",
+      409
+    );
+
+    await run(async t => {
+      C.staff(await user(t, req.user.uid), true);
+
+      const snap = await t.get(ref("walletTransactions", txId));
+      C.fail(snap.exists, "Retrait introuvable", 404);
+
+      const tx = snap.data();
+
+      C.fail(
+        tx.type === "withdraw" &&
+        tx.status === "pending" &&
+        tx.reservationSource === "server-v2",
+        "Retrait non déblocable par cette route",
+        409
+      );
+
+      const data = await user(t, tx.userId);
+      const money = C.money(data);
+      const amount = C.minor(tx.amount);
+
+      C.fail(
+        money.locked >= amount,
+        "Réservation insuffisante",
+        409
+      );
+
+      const fields = {
+        walletLocked: C.htg(money.locked - amount),
+        pendingAutomaticWithdrawId: null
+      };
+
+      if (data.withdrawResetAt === tx.reservedDay) {
+        fields.withdrawDailyTotal = C.htg(Math.max(
+          0,
+          C.minor(Number(data.withdrawDailyTotal || 0)) - amount
+        ));
+      }
+
+      t.update(ref("users", tx.userId), fields);
+
+      t.update(snap.ref, {
+        status: "failed",
+        failReason: reason,
+        failedAt: stamp(),
+        resolvedBy: req.user.uid
+      });
+
+      journal(
+        t, `unlock_${txId}`, tx.userId,
+        "withdraw_unlocked", amount,
+        money.wallet, money.locked - amount,
+        {
+          walletDelta: 0,
+          lockedDelta: -C.htg(amount),
+          withdrawTxId: txId
+        }
+      );
+
+      t.create(db.collection("merchantAuditLogs").doc(), {
+        actorUid: req.user.uid,
+        action: "withdraw-unlocked-after-review",
+        target: txId,
+        details: { reason },
+        createdAt: stamp()
+      });
+    });
+
+    res.json({ success: true });
+  }));
+
+  app.post("/set-pin", auth, wrap(async (req, res) => {
+    C.fail(/^\d{6}$/.test(req.body.pin || ""), "PIN invalide");
+
+    const hash = await bcrypt.hash(req.body.pin, 10);
+
+    await run(async t => {
+      const data = await user(t, req.user.uid);
+      C.fail(data.suspended !== true, "Compte suspendu", 403);
+
+      t.set(ref("userPrivate", req.user.uid), {
+        pinHash: hash,
+        pinFailedAttempts: 0,
+        pinLockUntilMs: 0,
+        pinUpdatedAt: stamp()
+      }, { merge: true });
+
+      t.update(ref("users", req.user.uid), {
+        "security.enabled": true,
+        "security.pinHash": admin.firestore.FieldValue.delete(),
+        "security.createdAt": stamp()
+      });
+    });
+
+    res.json({ success: true });
+  }));
+
+  app.post("/check-pin", auth, wrap(async (req, res) => {
+    const valid = await run(async t => {
+      const data = await user(t, req.user.uid);
+      C.fail(data.suspended !== true, "Compte suspendu", 403);
+
+      const ok = await pin(t, req.user.uid, data, req.body.pin);
+
+      if (ok) {
+        t.update(ref("users", req.user.uid), {
+          "security.lastVerified": stamp()
+        });
+      }
+
+      return ok;
+    });
+
+    res.json({ success: valid });
+  }));
+
+  app.post("/remove-pin", auth, wrap(async (req, res) => {
+    const valid = await run(async t => {
+      const data = await user(t, req.user.uid);
+      C.fail(data.suspended !== true, "Compte suspendu", 403);
+
+      if (!await pin(t, req.user.uid, data, req.body.pin)) {
+        return false;
+      }
+
+      t.set(ref("userPrivate", req.user.uid), {
+        pinHash: admin.firestore.FieldValue.delete(),
+        pinFailedAttempts: 0,
+        pinLockUntilMs: 0
+      }, { merge: true });
+
+      t.update(ref("users", req.user.uid), {
+        "security.enabled": false,
+        "security.pinHash": admin.firestore.FieldValue.delete(),
+        "security.lastVerified": stamp()
+      });
+
+      return true;
+    });
+
+    if (!valid) {
+      return res.status(400).json({
+        success: false,
+        error: "PIN incorrect"
+      });
+    }
+
+    res.json({ success: true });
+  }));
+
+  app.post("/api/manual-transfer", auth, (req, res) => {
+    uploadMemory.single("receipt")(req, res, err => {
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          error: "Capture invalide ou trop volumineuse"
+        });
+      }
+
+      wrap(async (req, res) => {
+        const uid = req.user.uid;
+        const body = req.body;
+
+        C.fail(
+          ["deposit", "withdraw"].includes(body.type),
+          "Type invalide"
+        );
+
+        const method = C.text(
+          body.method, "Méthode de transfert", 60, 1
+        );
+
+        const phone = C.text(body.phone, "Téléphone", 30, 8);
+
+        const amount = C.minor(
+          Number(
+            body.type === "withdraw"
+              ? body.amountRequested
+              : body.amount
+          ),
+          "Montant",
+          false
+        );
+
+        if (body.type === "withdraw") {
+          const fee = C.minor(
+            Number(body.feeApplied), "Frais estimés"
+          );
+
+          const receive = C.minor(
+            Number(body.amountToReceive),
+            "Montant à recevoir",
+            false
+          );
+
+          C.fail(
+            fee + receive === amount,
+            "Montant et frais incohérents"
+          );
+
+          const transferRef =
+            db.collection("manualTransfers").doc();
+
+          const result = await run(async t => {
+            const data = await user(t, uid);
+            enabled(data, "withdraw");
+
+            if (!await pin(t, uid, data, body.pin)) {
+              return { pinError: true };
+            }
+
+            if (data.pendingManualWithdrawId) {
+              const previous = await t.get(
+                ref("manualTransfers", data.pendingManualWithdrawId)
+              );
+
+              if (
+                previous.exists &&
+                previous.data().status === "pending"
+              ) {
+                return {
+                  success: true,
+                  transferId: previous.id,
+                  alreadyPending: true
+                };
+              }
+            }
+
+            const pending = await t.get(
+              db.collection("manualTransfers")
+                .where("userId", "==", uid)
+                .where("type", "==", "withdraw")
+                .where("status", "==", "pending")
+                .limit(1)
+            );
+
+            C.fail(
+              pending.empty,
+              "Un retrait manuel est déjà en attente",
+              409
+            );
+
+            const money = C.money(data);
+
+            C.fail(
+              money.available >= amount,
+              "Solde disponible insuffisant",
+              409
+            );
+
+            const daily = dailyLimit(data, uid, amount);
+
+            t.update(ref("users", uid), {
+              walletLocked: C.htg(money.locked + amount),
+              pendingManualWithdrawId: transferRef.id,
+              ...daily
+            });
+
+            t.create(transferRef, {
+              source: "server-v2",
+              userId: uid,
+              type: "withdraw",
+              method,
+              amountRequested: C.htg(amount),
+              feeApplied: C.htg(fee),
+              amountToReceive: C.htg(receive),
+              feeIsEstimate: true,
+              phone,
+              accountName: C.text(
+                body.accountName || "",
+                "Nom du bénéficiaire",
+                150
+              ),
+              status: "pending",
+              reservedDay: daily.withdrawResetAt,
+              createdAt: stamp()
+            });
+
+            journal(
+              t, `manual_hold_${transferRef.id}`, uid,
+              "manual_withdraw_pending", amount,
+              money.wallet, money.locked + amount,
+              {
+                transferId: transferRef.id,
+                walletDelta: 0,
+                lockedDelta: C.htg(amount)
+              }
+            );
+
+            return {
+              success: true,
+              transferId: transferRef.id
+            };
+          });
+
+          if (result.pinError) {
+            return res.status(400).json({
+              success: false,
+              error: "PIN incorrect"
+            });
+          }
+
+          return res.json(result);
+        }
+
+        C.fail(
+          req.file?.buffer?.length > 0,
+          "Capture d’écran obligatoire"
+        );
+
+        C.fail(
+          ["image/jpeg", "image/png", "image/webp"]
+            .includes(req.file.mimetype),
+          "Capture JPG, PNG ou WebP requise"
+        );
+
+        const fileHash = crypto.createHash("sha256")
+          .update(req.file.buffer)
+          .digest("hex");
+
+        const transferRef =
+          db.collection("manualTransfers").doc();
+
+        const fileName =
+          `receipts/${uid}/${crypto.randomUUID()}`;
+
+        const top = await ref("users", uid).get();
+        C.fail(top.exists, "Utilisateur introuvable", 404);
+        enabled(top.data(), "deposit");
+
+        const uploaded = await supabase.storage
+          .from("media")
           .upload(fileName, req.file.buffer, {
             contentType: req.file.mimetype,
             upsert: false
           });
 
-        if (error) {
-          throw new Error("Erreur Supabase: " + error.message);
+        C.fail(
+          !uploaded.error,
+          "Envoi de capture impossible",
+          503
+        );
+
+        try {
+          await run(async t => {
+            const data = await user(t, uid);
+            enabled(data, "deposit");
+
+            const claimRef =
+              ref("manualReceiptClaims", fileHash);
+
+            const claim = await t.get(claimRef);
+
+            C.fail(
+              !claim.exists,
+              "Cette capture a déjà été soumise",
+              409
+            );
+
+            t.create(claimRef, {
+              transferId: transferRef.id,
+              uid,
+              createdAt: stamp()
+            });
+
+            t.create(transferRef, {
+              source: "server-v2",
+              userId: uid,
+              type: "deposit",
+              method,
+              amount: C.htg(amount),
+              phone,
+              receiptFileName: fileName,
+              receiptUrl: supabase.storage
+                .from("media")
+                .getPublicUrl(fileName).data.publicUrl,
+              status: "pending",
+              createdAt: stamp()
+            });
+          });
+        } catch (e) {
+          await supabase.storage.from("media").remove([fileName]);
+          throw e;
         }
 
-        // Récupérer le lien public
-        const { data: publicUrlData } = supabase.storage
-          .from('media')
-          .getPublicUrl(fileName);
+        res.json({
+          success: true,
+          transferId: transferRef.id
+        });
+      })(req, res);
+    });
+  });
 
-        receiptUrl = publicUrlData.publicUrl;
-      } else {
-        throw new Error("Capture d'écran obligatoire");
-      }
+  app.post(
+    "/api/admin/review-legacy-manual-transfer",
+    auth,
+    wrap(async (req, res) => {
+      const id = C.id(req.body.transferId);
 
-      await db.collection("manualTransfers").add({
-        userId: uid,
-        type: "deposit",
-        method: body.method,
-        amount: Number(body.amount),
-        phone: body.phone,
-        receiptUrl: receiptUrl,
-        receiptFileName: uploadedFileName, 
-        status: "pending",
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      const reason = C.text(
+        req.body.reason,
+        "Vérification de l’ancienne demande",
+        2000,
+        15
+      );
+
+      await run(async t => {
+        C.staff(await user(t, req.user.uid), true);
+
+        const snap = await t.get(ref("manualTransfers", id));
+
+        C.fail(
+          snap.exists && snap.data().status === "pending",
+          "Demande introuvable ou déjà traitée",
+          409
+        );
+
+        t.update(snap.ref, {
+          legacyReviewedBy: req.user.uid,
+          legacyReviewReason: reason,
+          legacyReviewedAt: stamp()
+        });
+
+        t.create(db.collection("merchantAuditLogs").doc(), {
+          actorUid: req.user.uid,
+          action: "legacy-manual-transfer-reviewed",
+          target: id,
+          details: { reason },
+          createdAt: stamp()
+        });
       });
 
-      return res.json({ success: true });
-    }
+      res.json({ success: true });
+    })
+  );
 
-  } catch (e) {
-    console.log("MANUAL TRANSFER REQUEST ERROR:", e);
-    return res.status(500).json({ error: e.message });
-  }
-});
+  app.post(
+    "/api/admin/process-manual-transfer",
+    auth,
+    wrap(async (req, res) => {
+      const transferId = C.id(req.body.transferId);
+      const status = req.body.status;
 
-// 2. VALIDATION / REFUS PAR L'ADMIN
-app.post("/api/admin/process-manual-transfer", verifyFirebaseToken, async (req, res) => {
-  try {
-    const adminUid = req.user.uid;
-    const { transferId, status, reason } = req.body;
+      C.fail(
+        ["approved", "rejected"].includes(status),
+        "Statut invalide"
+      );
 
-    const adminRef = db.collection("users").doc(adminUid);
-    const adminSnap = await adminRef.get();
-    if (!adminSnap.exists || adminSnap.data().role !== "admin") {
-      return res.status(403).json({ error: "Accès refusé" });
-    }
+      const reason = status === "rejected"
+        ? C.text(req.body.reason, "Motif de refus", 1000, 5)
+        : "";
 
-    const transferRef = db.collection("manualTransfers").doc(transferId);
-    let imageToDelete = null; 
+      let receipt = null;
 
-    await db.runTransaction(async (t) => {
-      const transferSnap = await t.get(transferRef);
-      if (!transferSnap.exists) throw new Error("Transfert introuvable");
+      await run(async t => {
+        C.staff(await user(t, req.user.uid), true);
 
-      const transferData = transferSnap.data();
-      if (transferData.status !== "pending") {
-        throw new Error("Ce transfert a déjà été traité");
+        const snap = await t.get(
+          ref("manualTransfers", transferId)
+        );
+
+        C.fail(snap.exists, "Transfert introuvable", 404);
+        const transfer = snap.data();
+
+        C.fail(
+          transfer.status === "pending",
+          "Transfert déjà traité",
+          409
+        );
+
+        C.fail(
+          transfer.source === "server-v2" ||
+          transfer.legacyReviewedBy,
+          "Cette ancienne demande doit être vérifiée avant traitement",
+          409,
+          "LEGACY_REVIEW_REQUIRED"
+        );
+
+        C.fail(
+          ["deposit", "withdraw"].includes(transfer.type),
+          "Type invalide"
+        );
+
+        const amount = C.minor(
+          Number(
+            transfer.type === "withdraw"
+              ? transfer.amountRequested
+              : transfer.amount
+          ),
+          "Montant",
+          false
+        );
+
+        const data = await user(t, transfer.userId);
+        const money = C.money(data);
+
+        let wallet = money.wallet;
+        let locked = money.locked;
+        let walletDelta = 0;
+        let lockedDelta = 0;
+
+        if (transfer.type === "withdraw") {
+          C.fail(
+            locked >= amount,
+            "Réservation insuffisante",
+            409
+          );
+
+          locked -= amount;
+          lockedDelta = -amount;
+
+          if (status === "approved") {
+            C.fail(wallet >= amount, "Solde insuffisant", 409);
+            wallet -= amount;
+            walletDelta = -amount;
+          }
+
+          const fields = {
+            wallet: C.htg(wallet),
+            walletLocked: C.htg(locked),
+            pendingManualWithdrawId: null
+          };
+
+          if (
+            status === "rejected" &&
+            transfer.source === "server-v2" &&
+            data.withdrawResetAt === transfer.reservedDay
+          ) {
+            fields.withdrawDailyTotal = C.htg(Math.max(
+              0,
+              C.minor(Number(data.withdrawDailyTotal || 0)) - amount
+            ));
+          }
+
+          t.update(ref("users", transfer.userId), fields);
+        } else if (status === "approved") {
+          wallet += amount;
+          walletDelta = amount;
+
+          t.update(ref("users", transfer.userId), {
+            wallet: C.htg(wallet)
+          });
+        }
+
+        journal(
+          t, `manual_done_${transferId}`, transfer.userId,
+          `manual_${transfer.type}_${status}`,
+          amount, wallet, locked,
+          {
+            transferId,
+            walletDelta: C.htg(walletDelta),
+            lockedDelta: C.htg(lockedDelta)
+          }
+        );
+
+        t.update(snap.ref, {
+          status,
+          processedAt: stamp(),
+          processedBy: req.user.uid,
+          rejectReason: reason
+        });
+
+        if (status === "rejected") {
+          t.create(db.collection("notifications").doc(), {
+            to: transfer.userId,
+            from: req.user.uid,
+            type: "transfer_rejected",
+            message: `Demande refusée : ${reason}`,
+            read: false,
+            createdAt: stamp()
+          });
+        }
+
+        const name = transfer.receiptFileName;
+
+        receipt =
+          transfer.type === "deposit" &&
+          typeof name === "string" &&
+          (
+            name.startsWith(`receipts/${transfer.userId}/`) ||
+            name.startsWith(`${transfer.userId}_`)
+          )
+            ? name
+            : null;
+      });
+
+      if (receipt) {
+        try {
+          await supabase.storage.from("media").remove([receipt]);
+        } catch {
+          // Le nettoyage ne modifie pas le résultat comptable.
+        }
       }
 
-      const userRef = db.collection("users").doc(transferData.userId);
-      const userSnap = await t.get(userRef);
-      if (!userSnap.exists) throw new Error("Utilisateur introuvable");
-      
-      const userData = userSnap.data();
-      const wallet = Number(userData.wallet || 0);
-      const locked = Number(userData.walletLocked || 0);
+      res.json({ success: true });
+    })
+  );
 
-      // --- LOGIQUE RETRAIT ---
-      if (transferData.type === "withdraw") {
-        const amountReq = Number(transferData.amountRequested);
-        
-        if (status === "approved") {
-          t.update(userRef, {
-            wallet: Math.max(0, wallet - amountReq),
-            walletLocked: Math.max(0, locked - amountReq)
-          });
-          
-          const txRef = db.collection("walletTransactions").doc();
-          t.set(txRef, {
-            userId: transferData.userId,
-            type: "manual_withdraw_approved",
-            amount: amountReq,
-            status: "completed",
-            balanceAfter: Math.max(0, wallet - amountReq),
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
+  app.post(
+    "/api/merchant/admin/migrate-pin-hashes",
+    auth,
+    wrap(async (req, res) => {
+      const staff = await ref("users", req.user.uid).get();
+      C.staff(staff.exists ? staff.data() : null, true);
+
+      const apply = req.body.apply === true;
+
+      if (apply) {
+        C.fail(
+          process.env.MERCHANT_CHECKOUT_PAUSED === "true",
+          "Active la maintenance avant la migration",
+          409
+        );
+
+        C.fail(
+          req.body.confirm === "MIGRATE_PRIVATE_PINS",
+          "Confirmation de migration manquante"
+        );
+      }
+
+      const found = await db.collection("users")
+        .where("security.pinHash", ">=", "")
+        .limit(201)
+        .get();
+
+      if (!apply) {
+        return res.json({
+          success: true,
+          preview: true,
+          found: found.size,
+          more: found.size > 200
+        });
+      }
+
+      let migrated = 0;
+
+      for (const row of found.docs.slice(0, 200)) {
+        const changed = await run(async t => {
+          C.staff(await user(t, req.user.uid), true);
+
+          const data = await user(t, row.id);
+          const privateRef = ref("userPrivate", row.id);
+          const previous = await t.get(privateRef);
+
+          if (typeof data.security?.pinHash !== "string") {
+            return false;
+          }
+
+          if (!previous.exists || !previous.data().pinHash) {
+            t.set(privateRef, {
+              pinHash: data.security.pinHash,
+              pinFailedAttempts: 0,
+              pinLockUntilMs: 0
+            }, { merge: true });
+          }
+
+          t.update(ref("users", row.id), {
+            "security.pinHash":
+              admin.firestore.FieldValue.delete()
           });
 
-        } else if (status === "rejected") {
-          t.update(userRef, {
-            walletLocked: Math.max(0, locked - amountReq)
-          });
-          
-          const notifRef = db.collection("notifications").doc();
-          t.set(notifRef, {
-            to: transferData.userId,
-            from: adminUid,
-            type: "transfer_rejected",
-            message: `Votre demande de retrait de ${amountReq} HTG a été refusée. Motif : ${reason}`,
-            read: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+          return true;
+        });
+
+        if (changed) migrated++;
+      }
+
+      res.json({
+        success: true,
+        migrated,
+        more: found.size > 200
+      });
+    })
+  );
+})();
+
+
+
+const merchantReportsV2 = (() => {
+  const { C } = merchantOrdersV2;
+  const { spawn } = require("node:child_process");
+
+  const IN = new Set([
+    "deposit",
+    "manual_deposit_approved",
+    "gift_received",
+    "gift_commission_received",
+    "merchant_sale_received",
+    "merchant_sale_fee",
+    "merchant_referral_reward",
+    "merchant_platform_fee",
+    "merchant_renewal_referral_reward",
+    "merchant_renewal_admin_fee",
+    "merchant_request_refund",
+    "merchant_order_refund"
+  ]);
+
+  const OUT = new Set([
+    "gift_sent",
+    "withdraw",
+    "manual_withdraw_approved",
+    "merchant_request_payment",
+    "merchant_renewal_payment",
+    "blue_payment_completed",
+    "merchant_order_created"
+  ]);
+
+  const LABELS = {
+    merchant_order_created: "Réservation d’achat",
+    merchant_order_paid: "Achat réglé",
+    merchant_order_unlocked: "Réservation annulée",
+    merchant_sale_reserved: "Vente en attente",
+    merchant_sale_received: "Vente réglée (net)",
+    merchant_sale_cancelled: "Vente annulée",
+    merchant_sale_fee: "Commission de vente",
+    merchant_sale_fee_refunded: "Commission remboursée",
+    merchant_sale_refunded: "Remboursement de vente",
+    merchant_platform_refund: "Remboursement financé par la plateforme",
+    merchant_order_refund: "Remboursement reçu",
+    merchant_legacy_reservation_adjustment:
+      "Correction d’ancienne réservation",
+    merchant_request_refund: "Ancien accès remboursé",
+    withdraw: "Retrait MonCash",
+    withdraw_reserved: "Réservation pour retrait",
+    withdraw_unlocked: "Réservation de retrait annulée",
+    manual_withdraw_pending: "Retrait manuel réservé",
+    manual_withdraw_approved: "Retrait manuel",
+    manual_withdraw_rejected: "Retrait manuel refusé",
+    manual_deposit_approved: "Recharge manuelle",
+    manual_deposit_rejected: "Recharge manuelle refusée",
+    deposit: "Recharge MonCash",
+    gift_sent: "Cadeau envoyé",
+    gift_received: "Cadeau reçu",
+    gift_commission_received: "Commission cadeau"
+  };
+
+  function entry(id, row) {
+    let walletDelta = null;
+    let lockedDelta = null;
+
+    if (
+      row.accountingVersion === 2 &&
+      typeof row.walletDelta === "number"
+    ) {
+      walletDelta = row.walletDelta;
+      lockedDelta = row.lockedDelta || 0;
+    } else if (row.status === "completed") {
+      if (IN.has(row.type)) {
+        walletDelta = Number(row.amount || 0);
+      } else if (OUT.has(row.type)) {
+        walletDelta = -Number(row.amount || 0);
+      } else if ([
+        "merchant_order_paid",
+        "merchant_sale_pending",
+        "merchant_sale_rejected"
+      ].includes(row.type)) {
+        walletDelta = 0;
+      }
+    }
+
+    return {
+      id,
+      type: row.type,
+      description: LABELS[row.type] || row.type,
+      amount: Number(row.amount || 0),
+      status: row.status || "unknown",
+      walletDelta,
+      lockedDelta,
+      heldDelta: Number.isFinite(row.heldDelta)
+        ? row.heldDelta
+        : null,
+      balanceAfter: Number.isFinite(row.balanceAfter)
+        ? row.balanceAfter
+        : null,
+      walletLockedAfter: Number.isFinite(row.walletLockedAfter)
+        ? row.walletLockedAfter
+        : null,
+      orderId: row.orderId || null,
+      atMs: C.asMs(row.completedAt || row.createdAt),
+      scope: row.scope || "wallet",
+      correction:
+        row.type === "merchant_legacy_reservation_adjustment",
+      legacy: row.accountingVersion !== 2
+    };
+  }
+
+  function compute(
+    user, orders, rows, products, selectedRange, now = Date.now()
+  ) {
+    const orderMap = new Map(orders.map(o => [o.id, o]));
+    const salesByOrder = new Map();
+
+    for (const row of rows) {
+      if (
+        row.type !== "merchant_sale_received" ||
+        row.status !== "completed"
+      ) continue;
+
+      const key = row.orderId || `unlinked:${row.id}`;
+
+      C.fail(
+        !salesByOrder.has(key),
+        "Règlements en double à rapprocher avant de produire les statistiques",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      const order = orderMap.get(row.orderId) || {};
+      const net = C.minor(Number(row.amount || 0));
+      const fee = C.minor(Number(row.feeAmount || 0));
+
+      const gross = C.minor(Number(
+        row.grossAmount ??
+        order.totalAmount ??
+        C.htg(net + fee)
+      ));
+
+      C.fail(
+        net + fee === gross,
+        "Ancien règlement incohérent à rapprocher",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      salesByOrder.set(key, {
+        orderId: row.orderId,
+        productId: order.productId || row.productId || "unknown",
+        productName:
+          order.productName || row.productName || "Ancien produit",
+        quantity: Number(order.quantity || row.quantity || 0),
+        gross,
+        fee,
+        net,
+        at: row.createdAt
+      });
+    }
+
+    const sales = [...salesByOrder.values()];
+
+    const aggregate = range => {
+      const chosen = sales.filter(s => C.inRange(s.at, range));
+
+      return {
+        count: chosen.length,
+        gross: C.htg(chosen.reduce((n, s) => n + s.gross, 0)),
+        fee: C.htg(chosen.reduce((n, s) => n + s.fee, 0)),
+        net: C.htg(chosen.reduce((n, s) => n + s.net, 0)),
+        units: chosen.reduce((n, s) => n + s.quantity, 0)
+      };
+    };
+
+    const chosen = sales.filter(
+      s => C.inRange(s.at, selectedRange)
+    );
+
+    const daily = new Map();
+    const best = new Map();
+
+    for (const sale of chosen) {
+      const date = C.day(C.asMs(sale.at));
+
+      const day = daily.get(date) || {
+        date,
+        grossMinor: 0,
+        netMinor: 0,
+        count: 0
+      };
+
+      day.grossMinor += sale.gross;
+      day.netMinor += sale.net;
+      day.count++;
+      daily.set(date, day);
+
+      const product = best.get(sale.productId) || {
+        name: sale.productName,
+        quantity: 0,
+        grossMinor: 0
+      };
+
+      product.quantity += sale.quantity;
+      product.grossMinor += sale.gross;
+      best.set(sale.productId, product);
+    }
+
+    const warnings = [];
+
+    if (orders.some(
+      o => !o.accountingVersion && o.status === "pending"
+    )) {
+      warnings.push(
+        "Des anciennes réservations doivent être migrées. Leur montant n’est pas inclus dans les fonds sécurisés v2."
+      );
+    }
+
+    if (orders.some(o =>
+      o.status === "completed" &&
+      !salesByOrder.has(o.id) &&
+      o.fundsStatus !== "refunded"
+    )) {
+      warnings.push(
+        "Au moins une ancienne commande indiquée terminée ne possède pas de règlement vérifiable."
+      );
+    }
+
+    const money = C.money(user, true);
+
+    if (money.locked > money.wallet) {
+      warnings.push(
+        "Le wallet contient des réservations anciennes incohérentes. Un rapprochement est nécessaire."
+      );
+    }
+
+    const transactions = rows
+      .map(row => entry(row.id, row))
+      .filter(row =>
+        row.atMs && C.inRange(row.atMs, selectedRange)
+      )
+      .sort((a, b) =>
+        a.atMs - b.atMs || a.id.localeCompare(b.id)
+      );
+
+    const pending = orders.filter(o =>
+      o.accountingVersion === 2 && o.fundsStatus === "held"
+    );
+
+    const refunded = orders.filter(o =>
+      o.fundsStatus === "refunded" &&
+      C.inRange(o.refundedAt, selectedRange)
+    );
+
+    const withdrawals = transactions.filter(tx =>
+      ["withdraw", "manual_withdraw_approved"].includes(tx.type) &&
+      tx.status === "completed"
+    );
+
+    const refundsNet = transactions.filter(tx =>
+      tx.type === "merchant_sale_refunded" &&
+      tx.status === "completed"
+    );
+
+    const counts = {};
+
+    for (const order of orders) {
+      const status = order.status || "unknown";
+      counts[status] = (counts[status] || 0) + 1;
+    }
+
+    return {
+      success: true,
+      range: selectedRange,
+      generatedAtMs: now,
+
+      shop: {
+        name: user.merchantShopName || "Boutique",
+        logo: user.merchantLogo || "",
+        email: user.merchantEmail || user.email || ""
+      },
+
+      period: {
+        ...aggregate(selectedRange),
+        ordersCreated: orders.filter(
+          o => C.inRange(o.createdAt, selectedRange)
+        ).length,
+        refundsGross: C.htg(refunded.reduce(
+          (n, o) => n + C.minor(o.totalAmount), 0
+        )),
+        refundsNet: C.htg(refundsNet.reduce(
+          (n, tx) => n + C.minor(tx.amount), 0
+        )),
+        withdrawalsGlobalWallet: C.htg(withdrawals.reduce(
+          (n, tx) => n + C.minor(tx.amount), 0
+        ))
+      },
+
+      periods: {
+        today: aggregate(C.range({ period: "today" }, now)),
+        week: aggregate(C.range({ period: "7" }, now)),
+        month: aggregate(C.range({ period: "month" }, now))
+      },
+
+      snapshot: {
+        wallet: C.htg(money.wallet),
+        walletLocked: C.htg(money.locked),
+        walletAvailable: C.htg(money.available),
+        merchantPending: C.htg(pending.reduce(
+          (n, o) => n + C.minor(o.merchantNet), 0
+        )),
+        totalOrders: orders.length,
+        activeProducts: products.filter(p =>
+          p.isActive === true && p.archived !== true
+        ).length,
+        counts
+      },
+
+      daily: [...daily.values()]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .map(x => ({
+          date: x.date,
+          gross: C.htg(x.grossMinor),
+          net: C.htg(x.netMinor),
+          count: x.count
+        })),
+
+      bestProducts: [...best.values()]
+        .sort((a, b) => b.quantity - a.quantity)
+        .slice(0, 5)
+        .map(x => ({
+          name: x.name,
+          quantity: x.quantity,
+          gross: C.htg(x.grossMinor)
+        })),
+
+      transactions,
+      warnings,
+
+      walletNotice:
+        "Le solde et les retraits concernent le portefeuille HaytiClips partagé (ventes, cadeaux et autres opérations). Les fonds en attente sont une situation actuelle, indépendante de la période du rapport. Les corrections comptables ne sont pas des recharges ni du chiffre d’affaires."
+    };
+  }
+
+  async function summary(options, uid, input) {
+    const now = Date.now();
+    const selectedRange = C.range(input, now);
+
+    return options.run(async tx => {
+      const user = await options.getUser(tx, uid);
+
+      C.fail(
+        user.merchantApprovedAt ||
+        ["active", "suspended"].includes(user.merchantStatus),
+        "Aucune boutique approuvée",
+        403
+      );
+
+      const [orders, rows, products] = await Promise.all([
+        tx.get(
+          options.db.collection("merchantOrders")
+            .where("merchantUid", "==", uid)
+            .limit(options.maxRows + 1)
+        ),
+        tx.get(
+          options.db.collection("walletTransactions")
+            .where("userId", "==", uid)
+            .limit(options.maxRows + 1)
+        ),
+        tx.get(
+          options.db.collection("merchantProducts")
+            .where("merchantUid", "==", uid)
+            .limit(options.maxRows + 1)
+        )
+      ]);
+
+      C.fail(
+        [orders, rows, products].every(
+          snap => snap.size <= options.maxRows
+        ),
+        "Volume supérieur à la limite de sécurité du rapport. Ajouter une lecture paginée par période avant de dépasser cette limite.",
+        413
+      );
+
+      const result = compute(
+        user,
+        orders.docs.map(s => ({ id: s.id, ...s.data() })),
+        rows.docs.map(s => ({ id: s.id, ...s.data() })),
+        products.docs.map(s => s.data()),
+        selectedRange,
+        now
+      );
+
+      result.shop.uid = uid;
+      return result;
+    });
+  }
+
+  function webpLogo(buffer) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        process.env.FFMPEG_PATH || "ffmpeg",
+        [
+          "-hide_banner",
+          "-loglevel", "error",
+          "-threads", "1",
+          "-i", "pipe:0",
+          "-frames:v", "1",
+          "-vf", "scale=400:400:force_original_aspect_ratio=decrease",
+          "-f", "image2pipe",
+          "-vcodec", "mjpeg",
+          "pipe:1"
+        ],
+        { timeout: 10000 }
+      );
+
+      const chunks = [];
+      let length = 0;
+
+      child.on("error", reject);
+      child.stdin.on("error", () => {});
+
+      child.stdout.on("data", chunk => {
+        length += chunk.length;
+
+        if (length > 5 * 1024 * 1024) {
+          child.kill();
+        } else {
+          chunks.push(chunk);
         }
-      } 
-      // --- LOGIQUE RECHARGE ---
-      else if (transferData.type === "deposit") {
-        const amount = Number(transferData.amount);
-        
-        if (status === "approved") {
-          const newWallet = wallet + amount;
-          t.update(userRef, { wallet: newWallet });
-          
-          const txRef = db.collection("walletTransactions").doc();
-          t.set(txRef, {
-            userId: transferData.userId,
-            type: "manual_deposit_approved",
-            amount: amount,
-            status: "completed",
-            balanceAfter: newWallet,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+      });
 
-        } else if (status === "rejected") {
-          const notifRef = db.collection("notifications").doc();
-          t.set(notifRef, {
-            to: transferData.userId,
-            from: adminUid,
-            type: "transfer_rejected",
-            message: `Votre recharge de ${amount} HTG a été refusée. Motif : ${reason}`,
-            read: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+      child.stderr.resume();
+
+      child.on("close", code => {
+        if (code === 0 && length) {
+          resolve(Buffer.concat(chunks));
+        } else {
+          reject(new Error("Logo non convertible"));
         }
+      });
 
-        if (transferData.receiptFileName) {
-          imageToDelete = transferData.receiptFileName;
-        } else if (transferData.receiptUrl) {
-          const urlParts = transferData.receiptUrl.split('/media/');
-          if (urlParts.length > 1) {
-            imageToDelete = decodeURIComponent(urlParts[1]);
+      child.stdin.end(buffer);
+    });
+  }
+
+  async function pdf(data, supabase, res) {
+    C.fail(
+      !data.warnings.length,
+      "Rapproche les anciennes données signalées dans le dashboard avant de générer un rapport financier",
+      409,
+      "RECONCILIATION_REQUIRED"
+    );
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      margin: 42,
+      bufferPages: true,
+      info: {
+        Title: `Rapport ${data.shop.name}`,
+        Author: "HaytiClips"
+      }
+    });
+
+    const chunks = [];
+
+    const finished = new Promise((resolve, reject) => {
+      doc.on("data", chunk => chunks.push(chunk));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+    });
+
+    const money = value =>
+      new Intl.NumberFormat("fr-HT", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }).format(value).replace(/[\u202f\u00a0]/g, " ") + " HTG";
+
+    const date = value =>
+      new Intl.DateTimeFormat("fr-FR", {
+        timeZone: C.TIMEZONE,
+        dateStyle: "short",
+        timeStyle: "short"
+      }).format(new Date(value));
+
+    const width = doc.page.width - 84;
+
+    function header() {
+      doc.fillColor("#ff0050")
+        .font("Helvetica-Bold")
+        .fontSize(19)
+        .text("HaytiClips | Rapport marchand");
+
+      doc.moveDown(0.4)
+        .fillColor("#222222")
+        .font("Helvetica")
+        .fontSize(9)
+        .text(
+          `${data.shop.name} - ${data.range.from} au ${data.range.to}`
+        );
+
+      doc.moveDown(0.8);
+    }
+
+    function room(height) {
+      if (doc.y + height > doc.page.height - 65) {
+        doc.addPage();
+        header();
+      }
+    }
+
+    function line(label, value) {
+      room(25);
+      const y = doc.y;
+
+      doc.font("Helvetica")
+        .fontSize(10)
+        .fillColor("#333333")
+        .text(label, 42, y, { width: width * 0.63 });
+
+      doc.font("Helvetica-Bold")
+        .text(value, 42 + width * 0.63, y, {
+          width: width * 0.37,
+          align: "right"
+        });
+
+      doc.y = y + 22;
+      doc.x = 42;
+    }
+
+    header();
+
+    if (data.shop.logo) {
+      try {
+        const url = new URL(data.shop.logo);
+        const base = new URL(process.env.SUPABASE_URL);
+
+        const prefix =
+          `/storage/v1/object/public/media/shops/${data.shop.uid}/`;
+
+        if (
+          url.origin === base.origin &&
+          url.pathname.startsWith(prefix)
+        ) {
+          const storagePath = decodeURIComponent(
+            url.pathname.split("/public/media/")[1]
+          );
+
+          const image = await supabase.storage
+            .from("media")
+            .download(storagePath);
+
+          if (!image.error) {
+            let buffer = Buffer.from(
+              await image.data.arrayBuffer()
+            );
+
+            if (buffer.length <= 15 * 1024 * 1024) {
+              if (
+                buffer.toString("ascii", 0, 4) === "RIFF" &&
+                buffer.toString("ascii", 8, 12) === "WEBP"
+              ) {
+                buffer = await webpLogo(buffer);
+              }
+
+              doc.image(
+                buffer,
+                doc.page.width - 106,
+                doc.y,
+                { fit: [64, 64] }
+              );
+            }
           }
         }
+      } catch {
+        // Une image illisible ne supprime pas l’identité textuelle.
       }
+    }
 
-      t.update(transferRef, {
-        status: status,
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
-        processedBy: adminUid,
-        rejectReason: status === "rejected" ? reason : ""
+    doc.font("Helvetica-Bold")
+      .fontSize(17)
+      .text(data.shop.name, { width: width - 80 });
+
+    doc.font("Helvetica")
+      .fontSize(9)
+      .text(`Identifiant : ${data.shop.uid}`, {
+        width: width - 80
+      })
+      .text(`Email : ${data.shop.email}`, {
+        width: width - 80
+      })
+      .text(
+        `Généré le ${date(data.generatedAtMs)} - heure d’Haïti`,
+        { width: width - 80 }
+      );
+
+    doc.y = Math.max(doc.y + 20, 180);
+
+    line(
+      "Chiffre d’affaires brut réglé sur la période",
+      money(data.period.gross)
+    );
+    line(
+      "Nombre de ventes réglées / unités",
+      `${data.period.count} / ${data.period.units}`
+    );
+    line(
+      "Frais des ventes réglées sur la période",
+      money(data.period.fee)
+    );
+    line(
+      "Fonds libérés au marchand (net)",
+      money(data.period.net)
+    );
+    line(
+      "Remboursements de ventes (débit marchand)",
+      money(data.period.refundsNet)
+    );
+    line(
+      "Montant brut remboursé aux acheteurs",
+      money(data.period.refundsGross)
+    );
+    line(
+      "Retraits du portefeuille partagé sur la période",
+      money(data.period.withdrawalsGlobalWallet)
+    );
+
+    doc.moveDown(0.7)
+      .font("Helvetica-Bold")
+      .fontSize(12)
+      .text("Situation actuelle au moment de génération")
+      .moveDown(0.5);
+
+    line(
+      "Ventes sécurisées en attente (net marchand)",
+      money(data.snapshot.merchantPending)
+    );
+    line(
+      "Portefeuille partagé : total",
+      money(data.snapshot.wallet)
+    );
+    line(
+      "Portefeuille partagé : réservé",
+      money(data.snapshot.walletLocked)
+    );
+    line(
+      "Portefeuille partagé : disponible",
+      money(data.snapshot.walletAvailable)
+    );
+
+    room(90);
+
+    doc.font("Helvetica")
+      .fontSize(8)
+      .fillColor("#555555")
+      .text(data.walletNotice)
+      .moveDown();
+
+    doc.font("Helvetica-Bold")
+      .fontSize(12)
+      .fillColor("#111111")
+      .text("Historique financier détaillé")
+      .moveDown(0.7);
+
+    if (!data.transactions.length) {
+      doc.font("Helvetica")
+        .fontSize(10)
+        .text("Aucun mouvement sur cette période.");
+    }
+
+    for (const tx of data.transactions) {
+      const body =
+        `${tx.description} - ${tx.status}\n` +
+        `Référence : ${tx.id}` +
+        (tx.orderId ? `\nCommande : ${tx.orderId}` : "");
+
+      const meta =
+        `Montant de référence : ${money(tx.amount)}` +
+        ` | Réservation : ${
+          tx.lockedDelta === null ? "n.d." : money(tx.lockedDelta)
+        }` +
+        ` | Attente marchand : ${
+          tx.heldDelta === null ? "n.d." : money(tx.heldDelta)
+        }` +
+        ` | Solde après : ${
+          tx.balanceAfter === null ? "n.d." : money(tx.balanceAfter)
+        }`;
+
+      const bodyHeight = doc.font("Helvetica")
+        .fontSize(8)
+        .heightOfString(body, { width: width - 120 });
+
+      const metaHeight = doc.font("Helvetica")
+        .fontSize(7)
+        .heightOfString(meta, { width });
+
+      const height =
+        16 + bodyHeight + 9 + metaHeight + 18;
+
+      room(height);
+      const y = doc.y;
+
+      doc.font("Helvetica-Bold")
+        .fontSize(8)
+        .fillColor("#111111")
+        .text(date(tx.atMs), 42, y);
+
+      doc.font("Helvetica")
+        .fontSize(8)
+        .text(body, 42, y + 16, {
+          width: width - 120
+        });
+
+      const delta = tx.walletDelta === null
+        ? "Non rapproché"
+        : `${tx.walletDelta >= 0 ? "+" : ""}${money(tx.walletDelta)}`;
+
+      doc.font("Helvetica-Bold")
+        .fontSize(9)
+        .text(delta, 42 + width - 115, y + 16, {
+          width: 115,
+          align: "right"
+        });
+
+      doc.font("Helvetica")
+        .fontSize(7)
+        .fillColor("#555555")
+        .text(meta, 42, y + 16 + bodyHeight + 9, { width });
+
+      doc.y = y + height;
+      doc.x = 42;
+
+      doc.moveTo(42, doc.y - 7)
+        .lineTo(doc.page.width - 42, doc.y - 7)
+        .strokeColor("#dddddd")
+        .stroke();
+    }
+
+    const pages = doc.bufferedPageRange();
+
+    for (
+      let i = pages.start;
+      i < pages.start + pages.count;
+      i++
+    ) {
+      doc.switchToPage(i);
+
+      const bottom = doc.page.margins.bottom;
+      doc.page.margins.bottom = 0;
+
+      doc.font("Helvetica")
+        .fontSize(8)
+        .fillColor("#666666")
+        .text(
+          `HaytiClips - ${i + 1}/${pages.count}`,
+          42,
+          doc.page.height - 32,
+          {
+            width,
+            align: "right",
+            lineBreak: false
+          }
+        );
+
+      doc.page.margins.bottom = bottom;
+    }
+
+    doc.end();
+    const buffer = await finished;
+
+    res.set("Content-Type", "application/pdf")
+      .set("Cache-Control", "no-store")
+      .set(
+        "Content-Disposition",
+        `attachment; filename="hayticlips-${data.range.from}-${data.range.to}.pdf"`
+      )
+      .send(buffer);
+  }
+
+  return { summary, compute, entry, pdf };
+})();
+
+
+
+(() => {
+  const {
+    C,
+    run,
+    getUser,
+    staffUser,
+    ref,
+    timestamp,
+    wrap,
+    audit,
+    maxRows
+  } = merchantOrdersV2;
+
+  const auth = verifyFirebaseToken;
+
+  app.get("/api/merchant/me", auth, wrap(async (req, res) => {
+    const result = await run(async tx => {
+      const user = await getUser(tx, req.user.uid);
+
+      const snap = await tx.get(
+        db.collection("merchantRequests")
+          .where("uid", "==", req.user.uid)
+          .limit(101)
+      );
+
+      C.fail(
+        snap.size <= 100,
+        "Historique des demandes à paginer",
+        409
+      );
+
+      const requests = snap.docs
+        .map(s => ({
+          id: s.id,
+          ...s.data(),
+          createdAtMs: C.asMs(s.data().createdAt)
+        }))
+        .sort((a, b) => b.createdAtMs - a.createdAtMs);
+
+      return {
+        success: true,
+        uid: req.user.uid,
+        username: user.username || "",
+        email: user.email || req.user.email || "",
+        role: user.role || "user",
+        suspended: user.suspended === true,
+        active: C.active(user),
+        status: user.merchantStatus || "none",
+
+        shop: {
+          name: user.merchantShopName || "",
+          bio: user.merchantBio || "",
+          logo: user.merchantLogo || "",
+          banner: user.merchantBanner || "",
+          email: user.merchantEmail || user.email || "",
+          phone: user.merchantPhone || "",
+          whatsapp: user.merchantWhatsapp || "",
+          address: user.merchantAddress || "",
+          zones: user.merchantDeliveryZones || "",
+          delivery: user.merchantDeliveryTerms || "",
+          category: user.merchantProductType || ""
+        },
+
+        lastRequest: requests[0] || null,
+        rejectReason:
+          user.merchantRejectReason ||
+          requests[0]?.rejectReason ||
+          "",
+        suspensionReason: user.merchantSuspensionReason || ""
+      };
+    });
+
+    res.json(result);
+  }));
+
+  app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
+    const body = req.body;
+
+    const fields = {
+      merchantBio: C.text(body.bio || "", "Description", 300),
+      merchantEmail: C.text(
+        body.email, "Email", 254, 3
+      ).toLowerCase(),
+      merchantPhone: C.text(
+        body.phone || "", "Téléphone", 30
+      ),
+      merchantWhatsapp: C.text(
+        body.whatsapp || "", "WhatsApp", 30
+      ),
+      merchantAddress: C.text(
+        body.address || "", "Adresse", 200
+      ),
+      merchantDeliveryZones: C.text(
+        body.zones || "", "Zones", 500
+      ),
+      merchantDeliveryTerms: C.text(
+        body.delivery || "", "Livraison", 1000
+      )
+    };
+
+    C.fail(
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fields.merchantEmail),
+      "Email invalide"
+    );
+
+    function ownMedia(value) {
+      const url = new URL(value);
+      const base = new URL(process.env.SUPABASE_URL);
+
+      C.fail(
+        url.origin === base.origin &&
+        url.pathname.startsWith(
+          `/storage/v1/object/public/media/shops/${req.user.uid}/`
+        ),
+        "Image de boutique invalide"
+      );
+
+      return url.href;
+    }
+
+    if (body.logo) fields.merchantLogo = ownMedia(body.logo);
+    if (body.banner) fields.merchantBanner = ownMedia(body.banner);
+
+    await run(async tx => {
+      const user = await getUser(tx, req.user.uid);
+
+      C.fail(C.active(user), "Boutique inactive", 403);
+
+      tx.update(ref("users", req.user.uid), {
+        ...fields,
+        merchantUpdatedAt: timestamp()
       });
     });
 
-    if (imageToDelete) {
-      try {
-        await supabase.storage.from('media').remove([imageToDelete]);
-        console.log("✅ Image supprimée de Supabase :", imageToDelete);
-      } catch (deleteErr) {
-        console.error("❌ Erreur lors de la suppression Supabase :", deleteErr.message);
+    res.json({ success: true });
+  }));
+
+  app.get("/api/merchant/shop", auth, wrap(async (req, res) => {
+    const uid = C.id(req.query.uid);
+    const user = await ref("users", uid).get();
+
+    C.fail(
+      user.exists && C.active(user.data()),
+      "Boutique temporairement indisponible",
+      404
+    );
+
+    const data = user.data();
+
+    const snap = await db.collection("merchantProducts")
+      .where("merchantUid", "==", uid)
+      .get();
+
+    const products = snap.docs
+      .filter(s =>
+        s.data().isActive === true &&
+        s.data().archived !== true
+      )
+      .map(s => ({
+        id: s.id,
+        ...s.data(),
+        createdAtMs: C.asMs(s.data().createdAt)
+      }));
+
+    res.json({
+      success: true,
+      merchantUid: uid,
+      username: data.username || "",
+      shop: {
+        name: data.merchantShopName || data.username,
+        logo: data.merchantLogo || data.avatar || "",
+        banner: data.merchantBanner || "",
+        bio: data.merchantBio || "",
+        email: data.merchantEmail || "",
+        phone: data.merchantPhone || "",
+        whatsapp: data.merchantWhatsapp || "",
+        zones: data.merchantDeliveryZones || "",
+        delivery: data.merchantDeliveryTerms || ""
+      },
+      products
+    });
+  }));
+
+  app.get("/api/merchant/products", auth, wrap(async (req, res) => {
+    const user = await ref("users", req.user.uid).get();
+
+    C.fail(
+      user.exists && C.active(user.data()),
+      "Boutique inactive",
+      403
+    );
+
+    const snap = await db.collection("merchantProducts")
+      .where("merchantUid", "==", req.user.uid)
+      .get();
+
+    res.json({
+      success: true,
+      products: snap.docs
+        .filter(s => s.data().archived !== true)
+        .map(s => ({
+          id: s.id,
+          ...s.data(),
+          createdAtMs: C.asMs(s.data().createdAt)
+        }))
+    });
+  }));
+
+  app.post("/api/merchant/save-product", auth, wrap(async (req, res) => {
+    const uid = req.user.uid;
+    const body = req.body;
+
+    const productRef = body.productId
+      ? ref("merchantProducts", C.id(body.productId))
+      : db.collection("merchantProducts").doc();
+
+    await run(async tx => {
+      C.fail(
+        C.active(await getUser(tx, uid)),
+        "Boutique inactive",
+        403
+      );
+
+      const previous = await tx.get(productRef);
+
+      C.fail(
+        !body.productId || previous.exists,
+        "Produit introuvable",
+        404
+      );
+
+      C.fail(
+        !previous.exists ||
+        previous.data().merchantUid === uid,
+        "Accès refusé",
+        403
+      );
+
+      if (previous.exists) {
+        C.fail(
+          Number.isInteger(body.expectedVersion) &&
+          body.expectedVersion === Number(
+            previous.data().version || 0
+          ),
+          "Produit ou stock modifié. Recharge les produits avant de réessayer.",
+          409
+        );
       }
+
+      const data = {
+        ...(previous.exists ? previous.data() : {}),
+        ...body
+      };
+
+      const name = C.text(data.name, "Nom produit", 80, 2);
+
+      const description = C.text(
+        data.description || "", "Description", 500
+      );
+
+      const price = C.htg(
+        C.minor(data.price, "Prix", false)
+      );
+
+      C.fail(
+        Number.isInteger(data.stock) &&
+        data.stock >= 0 &&
+        data.stock <= 1000000,
+        "Stock entier invalide"
+      );
+
+      C.fail(
+        Array.isArray(data.images) &&
+        data.images.length >= 1 &&
+        data.images.length <= 8,
+        "Ajoute entre 1 et 8 photos"
+      );
+
+      const base = new URL(process.env.SUPABASE_URL);
+
+      for (const image of data.images) {
+        const url = new URL(image);
+
+        C.fail(
+          url.origin === base.origin &&
+          url.pathname.startsWith(
+            `/storage/v1/object/public/media/products/${uid}/`
+          ),
+          "Photo non autorisée"
+        );
+      }
+
+      C.fail(
+        typeof data.isActive === "boolean",
+        "État produit invalide"
+      );
+
+      tx.set(productRef, {
+        merchantUid: uid,
+        name,
+        description,
+        price,
+        stock: data.stock,
+        images: data.images,
+        imageUrl: data.images[0],
+        isActive: data.isActive,
+        archived: false,
+        version: Number(previous.data()?.version || 0) + 1,
+        createdAt: previous.exists
+          ? previous.data().createdAt
+          : timestamp(),
+        updatedAt: timestamp()
+      });
+    });
+
+    res.json({
+      success: true,
+      productId: productRef.id
+    });
+  }));
+
+  app.post("/api/merchant/archive-product", auth, wrap(async (req, res) => {
+    await run(async tx => {
+      C.fail(
+        C.active(await getUser(tx, req.user.uid)),
+        "Boutique inactive",
+        403
+      );
+
+      const productRef = ref(
+        "merchantProducts",
+        C.id(req.body.productId)
+      );
+
+      const product = await tx.get(productRef);
+
+      C.fail(
+        product.exists &&
+        product.data().merchantUid === req.user.uid,
+        "Produit introuvable",
+        404
+      );
+
+      tx.update(productRef, {
+        isActive: false,
+        archived: true,
+        archivedAt: timestamp(),
+        version: Number(product.data().version || 0) + 1
+      });
+    });
+
+    res.json({ success: true });
+  }));
+
+  app.get("/api/merchant/admin/overview", auth, wrap(async (req, res) => {
+    const staff = await ref("users", req.user.uid).get();
+    C.staff(staff.exists ? staff.data() : null);
+
+    const [requests, merchants, orders, sales] =
+      await Promise.all([
+        db.collection("merchantRequests")
+          .where("status", "==", "pending")
+          .get(),
+        db.collection("users")
+          .where("merchantStatus", "in", ["active", "suspended"])
+          .get(),
+        db.collection("merchantOrders")
+          .limit(maxRows + 1)
+          .get(),
+        db.collection("walletTransactions")
+          .where("type", "==", "merchant_sale_received")
+          .limit(maxRows + 1)
+          .get()
+      ]);
+
+    C.fail(
+      orders.size <= maxRows && sales.size <= maxRows,
+      "Vue de gestion trop volumineuse : ajouter une agrégation paginée",
+      413
+    );
+
+    const heldNet = C.htg(
+      orders.docs
+        .filter(s =>
+          s.data().accountingVersion === 2 &&
+          s.data().fundsStatus === "held"
+        )
+        .reduce(
+          (n, s) => n + C.minor(s.data().merchantNet),
+          0
+        )
+    );
+
+    const releasedNet = C.htg(
+      sales.docs
+        .filter(s => s.data().status === "completed")
+        .reduce(
+          (n, s) => n + C.minor(s.data().amount),
+          0
+        )
+    );
+
+    const rows = [];
+
+    for (const snap of requests.docs) {
+      const request = snap.data();
+      const owner = await ref("users", request.uid).get();
+
+      rows.push({
+        id: snap.id,
+        uid: request.uid,
+        shopName: request.shopName,
+        productType: request.productType,
+        email: request.email || owner.data()?.email || "",
+        description: request.description || "",
+        legacyPaid: request.accessModel !== "free-v2",
+        claimedAmountPaid: request.amountPaid || 0,
+        username: owner.data()?.username || "Utilisateur",
+        createdAtMs: C.asMs(request.createdAt)
+      });
     }
 
-    return res.json({ success: true });
-    
-  } catch (e) {
-    console.error("ADMIN PROCESS TRANSFER ERROR:", e);
-    return res.status(500).json({ error: e.message });
-  }
-});
+    res.json({
+      success: true,
+      heldNet,
+      releasedNet,
+      legacyOpenOrders: orders.docs.filter(s =>
+        !s.data().accountingVersion &&
+        ["pending", "accepted"].includes(s.data().status)
+      ).length,
+      requests: rows.sort(
+        (a, b) => a.createdAtMs - b.createdAtMs
+      ),
+      merchants: merchants.docs.map(s => ({
+        uid: s.id,
+        username: s.data().username || "",
+        shopName: s.data().merchantShopName || "",
+        status: s.data().merchantStatus,
+        email: s.data().merchantEmail || "",
+        suspensionReason:
+          s.data().merchantSuspensionReason || ""
+      }))
+    });
+  }));
+
+  app.get("/api/merchant/admin/users", auth, wrap(async (req, res) => {
+    const staff = await ref("users", req.user.uid).get();
+    C.staff(staff.exists ? staff.data() : null, true);
+
+    const search = String(req.query.search || "").trim();
+    let docs = [];
+
+    if (search) {
+      C.fail(search.length <= 128, "Recherche trop longue");
+
+      if (!search.includes("/")) {
+        const byId = await ref("users", search).get();
+        if (byId.exists) docs.push(byId);
+      }
+
+      const lower = search.toLowerCase();
+
+      const names = await db.collection("users")
+        .where("usernameLower", ">=", lower)
+        .where("usernameLower", "<=", lower + "\uf8ff")
+        .limit(50)
+        .get();
+
+      docs.push(...names.docs);
+    } else {
+      const special = await db.collection("users")
+        .where("role", "in", [
+          "admin",
+          "moderator",
+          "badge_manager",
+          "merchant_manager"
+        ])
+        .limit(200)
+        .get();
+
+      docs = special.docs;
+    }
+
+    const users = [...new Map(
+      docs.map(s => [
+        s.id,
+        {
+          uid: s.id,
+          username: s.data().username || "",
+          avatar: s.data().avatar || "",
+          role: s.data().role || "user"
+        }
+      ])
+    ).values()];
+
+    res.json({ success: true, users });
+  }));
+
+  app.post("/api/merchant/admin/set-role", auth, wrap(async (req, res) => {
+    const target = C.id(req.body.targetUid);
+    const role = req.body.role;
+
+    C.fail(
+      ["user", "moderator", "badge_manager", "merchant_manager"]
+        .includes(role),
+      "Rôle non autorisé"
+    );
+
+    await run(async tx => {
+      await staffUser(tx, req.user.uid, true);
+      const user = await getUser(tx, target);
+
+      C.fail(
+        target !== req.user.uid &&
+        target !== ADMIN_UID &&
+        user.role !== "admin",
+        "Compte administrateur protégé",
+        403
+      );
+
+      tx.update(ref("users", target), { role });
+
+      audit(tx, req.user.uid, "set-role", target, {
+        role,
+        previous: user.role || "user"
+      });
+    });
+
+    res.json({ success: true });
+  }));
+
+  const reportOptions = {
+    db,
+    run,
+    getUser,
+    maxRows
+  };
+
+  app.get("/api/merchant/summary", auth, wrap(async (req, res) => {
+    const data = await merchantReportsV2.summary(
+      reportOptions,
+      req.user.uid,
+      req.query
+    );
+
+    res.json(data);
+  }));
+
+  app.get("/api/merchant/report.pdf", auth, wrap(async (req, res) => {
+    const data = await merchantReportsV2.summary(
+      reportOptions,
+      req.user.uid,
+      req.query
+    );
+
+    await merchantReportsV2.pdf(data, supabase, res);
+  }));
+})();
+
 
 const PORT = process.env.PORT || 3000;
 

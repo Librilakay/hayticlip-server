@@ -2397,7 +2397,67 @@ const merchantOrdersV2 = (() => {
       };
     }
 
+
+function deliveryRates(value, assignIds = false) {
+      fail(
+        Array.isArray(value) && value.length <= 30,
+        "Ajoute au maximum 30 zones."
+      );
+
+      const ids = new Set();
+      const labels = new Set();
+
+      return value.map(rate => {
+        fail(
+          rate &&
+          typeof rate === "object" &&
+          !Array.isArray(rate),
+          "Zone invalide."
+        );
+
+        const rateId = id(
+          (rate.id === undefined || rate.id === "") && assignIds
+            ? crypto.randomUUID()
+            : rate.id,
+          "Identifiant de zone"
+        );
+
+        const label = text(rate.label, "Nom de zone", 60, 2)
+          .normalize("NFC")
+          .replace(/\s+/g, " ");
+
+        const key = label.toLowerCase();
+
+        fail(
+          !ids.has(rateId) && !labels.has(key),
+          "Zone en double."
+        );
+
+        ids.add(rateId);
+        labels.add(key);
+
+        return {
+          id: rateId,
+          label,
+          price: htg(minor(rate.price, "Prix de livraison"))
+        };
+      });
+    }
+
+    function deliveryVersion(user = {}) {
+      const value = user.merchantDeliveryRatesVersion ?? 0;
+
+      fail(
+        Number.isSafeInteger(value) && value >= 0,
+        "Tarifs de livraison à vérifier.",
+        409
+      );
+
+      return value;
+    }
+
     function publicOrder(id, order) {
+
       const out = { id };
 
       for (const k of [
@@ -2409,7 +2469,12 @@ const merchantOrdersV2 = (() => {
         "customerNom", "customerPrenom", "customerEmail",
         "customerPhone", "customerWhatsapp", "customerSexe",
         "customerDetails", "disputeId", "disputeDeadlineMs",
-        "deliveryTerms", "stockRestored", "requiresReconciliation"
+
+"deliveryTerms", "stockRestored", "requiresReconciliation",
+        "itemsSubtotal", "deliveryMode", "deliveryZoneId",
+        "deliveryZoneName", "deliveryFee", "deliveryAddress",
+        "deliveryRatesVersion", "feeBaseAmount"
+
       ]) {
         if (order[k] !== undefined) out[k] = order[k];
       }
@@ -2428,7 +2493,10 @@ const merchantOrdersV2 = (() => {
       MerchantError, fail, text, id, minor, htg,
       feeFor, money, active, staff, operation, replay,
       sha, day, asMs, inRange, range, contact,
-      codecs, publicOrder, RATE_BPS, TIMEZONE
+
+codecs, publicOrder,
+      deliveryRates, deliveryVersion,
+      RATE_BPS, TIMEZONE
     };
   })();
 
@@ -2894,6 +2962,8 @@ const merchantOrdersV2 = (() => {
         feeAmount: C.htg(fee),
         productName: order.productName,
         quantity: order.quantity,
+        itemsSubtotal: order.itemsSubtotal ?? order.totalAmount,
+        deliveryFee: order.deliveryFee ?? 0,
         heldDelta: -C.htg(net)
       },
       net
@@ -2993,36 +3063,68 @@ const merchantOrdersV2 = (() => {
   }
 
   // ACHAT : réservation du montant, sans versement au marchand.
-  app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
+
+
+
+app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
     C.fail(
       process.env.MERCHANT_CHECKOUT_PAUSED === "false",
-      "Achats temporairement en maintenance",
+      "Achats temporairement en maintenance.",
       503,
       "CHECKOUT_PAUSED"
     );
 
     const uid = req.user.uid;
-    const productId = C.id(req.body.productId);
-    const qty = req.body.quantity ?? 1;
-    const customer = C.contact(req.body);
+    const body = req.body || {};
+    const productId = C.id(body.productId);
+    const qty = body.quantity ?? 1;
+    const customer = C.contact(body);
+    const deliveryMode = body.deliveryMode ?? "pickup";
 
     C.fail(
       Number.isInteger(qty) && qty > 0 && qty <= 1000,
-      "Quantité invalide"
+      "Quantité invalide."
     );
+
+    C.fail(
+      ["pickup", "delivery"].includes(deliveryMode),
+      "Choix de livraison invalide."
+    );
+
+    const delivery = deliveryMode === "delivery"
+      ? {
+          zoneId: C.id(
+            body.deliveryZoneId,
+            "Zone de livraison"
+          ),
+          address: C.text(
+            body.deliveryAddress,
+            "Adresse de livraison",
+            300,
+            5
+          )
+        }
+      : null;
+
+    // Conserve la compatibilité des anciennes tentatives.
+    const intentPayload = { productId, qty, customer };
+
+    if (delivery) {
+      intentPayload.delivery = delivery;
+    }
 
     const op = C.operation(
       uid,
       "buy",
       operationKey(req),
-      { productId, qty, customer }
+      intentPayload
     );
 
     const opRef = ref("merchantOperations", op.id);
     const orderRef = db.collection("merchantOrders").doc();
     const secret = codeTools().create(orderRef.id);
 
-    const out = await run(async tx => {
+    const result = await run(async tx => {
       const previous = C.replay(
         await tx.get(opRef),
         op.fingerprint
@@ -3031,65 +3133,122 @@ const merchantOrdersV2 = (() => {
       if (previous) return previous;
 
       const buyer = await getUser(tx, uid);
-      C.fail(buyer.suspended !== true, "Compte suspendu", 403);
+
+      C.fail(
+        buyer.suspended !== true,
+        "Compte suspendu.",
+        403
+      );
 
       const pRef = ref("merchantProducts", productId);
       const p = await tx.get(pRef);
 
-      C.fail(p.exists, "Produit introuvable", 404);
+      C.fail(p.exists, "Produit introuvable.", 404);
 
       const product = p.data();
 
       C.fail(
-        product.isActive === true && product.archived !== true,
-        "Produit indisponible",
+        product.isActive === true &&
+        product.archived !== true,
+        "Produit indisponible.",
         409
       );
 
       C.fail(
         product.merchantUid !== uid,
-        "Vous ne pouvez pas acheter vos propres produits"
+        "Tu ne peux pas acheter tes propres produits."
       );
 
-      const merchant = await getUser(tx, product.merchantUid);
-
-      C.fail(C.active(merchant), "Boutique inactive", 409);
+      const merchant = await getUser(
+        tx,
+        product.merchantUid
+      );
 
       C.fail(
-        Number.isInteger(product.stock) && product.stock >= qty,
-        "Stock insuffisant",
+        C.active(merchant),
+        "Boutique inactive.",
         409
       );
 
-
-const unit = C.minor(product.price, "Prix", false);
-      const gross = unit * qty;
-      const fee = C.feeFor(gross);
-      const net = gross - fee;
-
-      const expectedTotal = C.minor(
-        req.body.expectedTotal,
-        "Total confirmé",
-        false
+      C.fail(
+        Number.isInteger(product.stock) &&
+        product.stock >= qty,
+        "Stock insuffisant.",
+        409
       );
 
+      const version = C.deliveryVersion(merchant);
+
+      let zone = null;
+      let deliveryMinor = 0;
+
+      if (delivery) {
+        C.fail(
+          Number.isSafeInteger(body.deliveryRatesVersion) &&
+          body.deliveryRatesVersion === version,
+          "La livraison a changé. Actualise puis confirme.",
+          409,
+          "DELIVERY_CHANGED"
+        );
+
+        zone = C.deliveryRates(
+          merchant.merchantDeliveryRates ?? []
+        ).find(rate => rate.id === delivery.zoneId);
+
+        C.fail(
+          zone,
+          "Cette zone n'est plus proposée.",
+          409,
+          "DELIVERY_CHANGED"
+        );
+
+        deliveryMinor = C.minor(
+          zone.price,
+          "Prix de livraison"
+        );
+      }
+
+      const unit = C.minor(product.price, "Prix", false);
+      const itemsMinor = unit * qty;
+
+      // Commission sur les produits, livraison hors commission.
+      const fee = C.feeFor(itemsMinor);
+      const gross = itemsMinor + deliveryMinor;
+
+      C.minor(C.htg(gross), "Total", false);
+
+      const net = gross - fee;
+
       C.fail(
-        gross === expectedTotal,
-        "Le prix a changé. Actualise la boutique et confirme le nouveau montant.",
+        gross === C.minor(
+          body.expectedTotal,
+          "Total confirmé",
+          false
+        ),
+        "Le prix a changé. Actualise puis confirme.",
         409,
         "PRICE_CHANGED"
       );
 
-
+      const shipping = {
+        itemsSubtotal: C.htg(itemsMinor),
+        deliveryMode,
+        deliveryZoneId: zone?.id || "",
+        deliveryZoneName: zone?.label || "",
+        deliveryFee: C.htg(deliveryMinor),
+        deliveryAddress: delivery?.address || "",
+        deliveryRatesVersion: version,
+        feeBaseAmount: C.htg(itemsMinor)
+      };
 
       const ledger = accounting(tx);
-      const a = await ledger.account(uid);
+      const account = await ledger.account(uid);
 
       C.money(buyer);
 
       C.fail(
-        a.available >= gross,
-        "Solde disponible insuffisant",
+        account.available >= gross,
+        "Solde disponible insuffisant.",
         409
       );
 
@@ -3104,7 +3263,8 @@ const unit = C.minor(product.price, "Prix", false);
           orderId: orderRef.id,
           merchantUid: product.merchantUid,
           productId,
-          note: "Réservation sans débit du wallet"
+          itemsSubtotal: shipping.itemsSubtotal,
+          deliveryFee: shipping.deliveryFee
         }
       );
 
@@ -3118,20 +3278,21 @@ const unit = C.minor(product.price, "Prix", false);
         merchantUid: product.merchantUid,
         productId,
         productName: product.name,
-        productImage: product.images?.[0] || product.imageUrl || "",
+        productImage:
+          product.images?.[0] || product.imageUrl || "",
         quantity: qty,
         unitPrice: C.htg(unit),
         totalAmount: C.htg(gross),
         feeAmount: C.htg(fee),
         merchantNet: C.htg(net),
         feeRateBps: C.RATE_BPS,
-        feePolicy: "percent-3",
+        feePolicy: "percent-3-items",
         accountingVersion: 2,
         status: "pending",
         fundsStatus: "held",
-        deliveryTerms: merchant.merchantDeliveryTerms ||
-          "À convenir avant remise du code",
+        deliveryTerms: merchant.merchantDeliveryTerms || "",
         stockRestored: false,
+        ...shipping,
         ...customer,
         createdAt: timestamp()
       });
@@ -3154,6 +3315,8 @@ const unit = C.minor(product.price, "Prix", false);
           amount: C.htg(net),
           grossAmount: C.htg(gross),
           feeAmount: C.htg(fee),
+          itemsSubtotal: shipping.itemsSubtotal,
+          deliveryFee: shipping.deliveryFee,
           walletDelta: 0,
           lockedDelta: 0,
           heldDelta: C.htg(net),
@@ -3168,14 +3331,16 @@ const unit = C.minor(product.price, "Prix", false);
         product.merchantUid,
         uid,
         "merchant_order",
-        "Nouvelle commande à préparer. Les fonds restent en attente.",
+        "Nouvelle commande à préparer.",
         `order:${orderRef.id}`,
         { orderId: orderRef.id }
       );
 
-      const result = {
+      const response = {
         success: true,
         orderId: orderRef.id,
+        itemsSubtotal: shipping.itemsSubtotal,
+        deliveryFee: shipping.deliveryFee,
         totalAmount: C.htg(gross),
         feeAmount: C.htg(fee)
       };
@@ -3184,15 +3349,16 @@ const unit = C.minor(product.price, "Prix", false);
         uid,
         kind: "buy",
         fingerprint: op.fingerprint,
-        result,
+        result: response,
         createdAt: timestamp()
       });
 
       ledger.flush();
-      return result;
+
+      return response;
     });
 
-    res.json(out);
+    res.json(result);
   }));
 
   app.get("/api/merchant/orders", auth, wrap(async (req, res) => {
@@ -6701,9 +6867,27 @@ const merchantReportsV2 = (() => {
         C.htg(net + fee)
       ));
 
-      C.fail(
+
+C.fail(
         net + fee === gross,
         "Ancien règlement incohérent à rapprocher",
+        409,
+        "RECONCILIATION_REQUIRED"
+      );
+
+      const deliveryFee = C.minor(Number(
+        row.deliveryFee ?? order.deliveryFee ?? 0
+      ));
+
+      const itemsSubtotal = C.minor(Number(
+        row.itemsSubtotal ??
+        order.itemsSubtotal ??
+        C.htg(gross - deliveryFee)
+      ));
+
+      C.fail(
+        itemsSubtotal + deliveryFee === gross,
+        "Produits et livraison incohérents.",
         409,
         "RECONCILIATION_REQUIRED"
       );
@@ -6714,9 +6898,12 @@ const merchantReportsV2 = (() => {
         productName:
           order.productName || row.productName || "Ancien produit",
         quantity: Number(order.quantity || row.quantity || 0),
-        gross,
+
+gross,
         fee,
         net,
+        itemsSubtotal,
+        deliveryFee,
         at: row.createdAt
       });
     }
@@ -6728,7 +6915,16 @@ const merchantReportsV2 = (() => {
 
       return {
         count: chosen.length,
-        gross: C.htg(chosen.reduce((n, s) => n + s.gross, 0)),
+
+gross: C.htg(
+          chosen.reduce((n, s) => n + s.gross, 0)
+        ),
+        itemsSubtotal: C.htg(
+          chosen.reduce((n, s) => n + s.itemsSubtotal, 0)
+        ),
+        deliveryFees: C.htg(
+          chosen.reduce((n, s) => n + s.deliveryFee, 0)
+        ),
         fee: C.htg(chosen.reduce((n, s) => n + s.fee, 0)),
         net: C.htg(chosen.reduce((n, s) => n + s.net, 0)),
         units: chosen.reduce((n, s) => n + s.quantity, 0)
@@ -7006,7 +7202,8 @@ const merchantReportsV2 = (() => {
     });
   }
 
-  async function pdf(data, supabase, res) {
+  async function 
+pdf(data, supabase, res) {
     C.fail(
       !data.warnings.length,
       "Rapproche les anciennes données signalées dans le dashboard avant de générer un rapport financier",
@@ -7160,11 +7357,22 @@ const merchantReportsV2 = (() => {
 
     doc.y = Math.max(doc.y + 20, 180);
 
-    line(
-      "Chiffre d’affaires brut réglé sur la période",
+
+
+line(
+      "Total des ventes réglées",
       money(data.period.gross)
     );
+
     line(
+      "Dont produits",
+      money(data.period.itemsSubtotal)
+    );
+
+    line(
+      "Dont livraison",
+      money(data.period.deliveryFees)
+    );    line(
       "Nombre de ventes réglées / unités",
       `${data.period.count} / ${data.period.units}`
     );
@@ -7405,8 +7613,12 @@ const merchantReportsV2 = (() => {
           whatsapp: user.merchantWhatsapp || "",
           address: user.merchantAddress || "",
           zones: user.merchantDeliveryZones || "",
-          delivery: user.merchantDeliveryTerms || "",
-          category: user.merchantProductType || ""
+delivery: user.merchantDeliveryTerms || "",
+          category: user.merchantProductType || "",
+          deliveryRates: C.deliveryRates(
+            user.merchantDeliveryRates ?? []
+          ),
+          deliveryRatesVersion: C.deliveryVersion(user)
         },
 
         lastRequest: requests[0] || null,
@@ -7421,8 +7633,10 @@ const merchantReportsV2 = (() => {
     res.json(result);
   }));
 
-  app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
-    const body = req.body;
+
+
+app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
+    const body = req.body || {};
 
     const fields = {
       merchantBio: C.text(body.bio || "", "Description", 300),
@@ -7438,21 +7652,34 @@ const merchantReportsV2 = (() => {
       merchantAddress: C.text(
         body.address || "", "Adresse", 200
       ),
-      merchantDeliveryZones: C.text(
-        body.zones || "", "Zones", 500
-      ),
       merchantDeliveryTerms: C.text(
         body.delivery || "", "Livraison", 1000
       )
     };
 
+    // Conserve l'ancien texte des zones s'il n'est pas envoyé.
+    if (Object.prototype.hasOwnProperty.call(body, "zones")) {
+      fields.merchantDeliveryZones =
+        C.text(body.zones, "Zones", 500);
+    }
+
     C.fail(
       /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fields.merchantEmail),
-      "Email invalide"
+      "Email invalide."
     );
 
     function ownMedia(value) {
-      const url = new URL(value);
+      let url;
+
+      try {
+        url = new URL(value);
+      } catch {
+        throw new C.MerchantError(
+          400,
+          "Image de boutique invalide."
+        );
+      }
+
       const base = new URL(process.env.SUPABASE_URL);
 
       C.fail(
@@ -7460,7 +7687,7 @@ const merchantReportsV2 = (() => {
         url.pathname.startsWith(
           `/storage/v1/object/public/media/shops/${req.user.uid}/`
         ),
-        "Image de boutique invalide"
+        "Image de boutique invalide."
       );
 
       return url.href;
@@ -7469,18 +7696,91 @@ const merchantReportsV2 = (() => {
     if (body.logo) fields.merchantLogo = ownMedia(body.logo);
     if (body.banner) fields.merchantBanner = ownMedia(body.banner);
 
-    await run(async tx => {
+    const hasRates = Object.prototype.hasOwnProperty.call(
+      body,
+      "deliveryRates"
+    );
+
+    const rates = hasRates
+      ? C.deliveryRates(body.deliveryRates, true)
+      : null;
+
+    const result = await run(async tx => {
       const user = await getUser(tx, req.user.uid);
 
-      C.fail(C.active(user), "Boutique inactive", 403);
+      C.fail(C.active(user), "Boutique inactive.", 403);
 
-      tx.update(ref("users", req.user.uid), {
+      const changes = {
         ...fields,
         merchantUpdatedAt: timestamp()
-      });
+      };
+
+      let version = C.deliveryVersion(user);
+
+      if (hasRates) {
+        C.fail(
+          Number.isSafeInteger(body.expectedDeliveryRatesVersion) &&
+          body.expectedDeliveryRatesVersion === version,
+          "Les zones ont changé. Recharge-les avant d'enregistrer.",
+          409,
+          "DELIVERY_CHANGED"
+        );
+
+        const previous = C.deliveryRates(
+          user.merchantDeliveryRates ?? []
+        );
+
+        const knownIds = new Set(
+          previous.map(rate => rate.id)
+        );
+
+        for (const rate of body.deliveryRates) {
+          if (rate.id !== undefined && rate.id !== "") {
+            C.fail(
+              knownIds.has(rate.id),
+              "Zone supprimée ou inconnue. Recharge les zones.",
+              409,
+              "DELIVERY_CHANGED"
+            );
+          }
+        }
+
+        const changed =
+          JSON.stringify(previous) !== JSON.stringify(rates);
+
+        if (changed) version++;
+
+        C.fail(
+          Number.isSafeInteger(version),
+          "Version des tarifs invalide."
+        );
+
+        changes.merchantDeliveryRates = rates;
+        changes.merchantDeliveryRatesVersion = version;
+
+        if (changed) {
+          audit(
+            tx,
+            req.user.uid,
+            "delivery-rates-updated",
+            req.user.uid,
+            { version, rates }
+          );
+        }
+      }
+
+      tx.update(ref("users", req.user.uid), changes);
+
+      return {
+        success: true,
+        deliveryRates: rates ?? C.deliveryRates(
+          user.merchantDeliveryRates ?? []
+        ),
+        deliveryRatesVersion: version
+      };
     });
 
-    res.json({ success: true });
+    res.json(result);
   }));
 
   app.get("/api/merchant/shop", auth, wrap(async (req, res) => {
@@ -7522,8 +7822,13 @@ const merchantReportsV2 = (() => {
         email: data.merchantEmail || "",
         phone: data.merchantPhone || "",
         whatsapp: data.merchantWhatsapp || "",
-        zones: data.merchantDeliveryZones || "",
-        delivery: data.merchantDeliveryTerms || ""
+zones: data.merchantDeliveryZones || "",
+        delivery: data.merchantDeliveryTerms || "",
+        address: data.merchantAddress || "",
+        deliveryRates: C.deliveryRates(
+          data.merchantDeliveryRates ?? []
+        ),
+        deliveryRatesVersion: C.deliveryVersion(data)
       },
       products
     });

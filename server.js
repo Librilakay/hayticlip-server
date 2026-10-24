@@ -3061,10 +3061,26 @@ const merchantOrdersV2 = (() => {
         409
       );
 
-      const unit = C.minor(product.price, "Prix", false);
+
+const unit = C.minor(product.price, "Prix", false);
       const gross = unit * qty;
       const fee = C.feeFor(gross);
       const net = gross - fee;
+
+      const expectedTotal = C.minor(
+        req.body.expectedTotal,
+        "Total confirmé",
+        false
+      );
+
+      C.fail(
+        gross === expectedTotal,
+        "Le prix a changé. Actualise la boutique et confirme le nouveau montant.",
+        409,
+        "PRICE_CHANGED"
+      );
+
+
 
       const ledger = accounting(tx);
       const a = await ledger.account(uid);

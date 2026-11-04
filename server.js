@@ -7692,9 +7692,6 @@ pdf(data, supabase, res) {
       "RECONCILIATION_REQUIRED"
     );
 
-        Author: "HaytiClips"
-      }
-    });
 
 
 const PDFDocument = require("pdfkit");
@@ -7838,11 +7835,11 @@ finished.catch(() => {});
       }
     }
 
-    doc.font("Helvetica-Bold")
+    doc.font("Bold")
       .fontSize(17)
       .text(data.shop.name, { width: width - 80 });
 
-    doc.font("Helvetica")
+    doc.font("Body")
       .fontSize(9)
       .text(`Identifiant : ${data.shop.uid}`, {
         width: width - 80
@@ -7898,7 +7895,7 @@ line(
     );
 
     doc.moveDown(0.7)
-      .font("Helvetica-Bold")
+      .font("Bold")
       .fontSize(12)
       .text("Situation actuelle au moment de génération")
       .moveDown(0.5);
@@ -7922,20 +7919,20 @@ line(
 
     room(90);
 
-    doc.font("Helvetica")
+    doc.font("Body")
       .fontSize(8)
       .fillColor("#555555")
       .text(data.walletNotice)
       .moveDown();
 
-    doc.font("Helvetica-Bold")
+    doc.font("Bold")
       .fontSize(12)
       .fillColor("#111111")
       .text("Historique financier détaillé")
       .moveDown(0.7);
 
     if (!data.transactions.length) {
-      doc.font("Helvetica")
+      doc.font("Body")
         .fontSize(10)
         .text("Aucun mouvement sur cette période.");
     }
@@ -7958,11 +7955,11 @@ line(
           tx.balanceAfter === null ? "n.d." : money(tx.balanceAfter)
         }`;
 
-      const bodyHeight = doc.font("Helvetica")
+      const bodyHeight = doc.font("Body")
         .fontSize(8)
         .heightOfString(body, { width: width - 120 });
 
-      const metaHeight = doc.font("Helvetica")
+      const metaHeight = doc.font("Body")
         .fontSize(7)
         .heightOfString(meta, { width });
 
@@ -7972,12 +7969,12 @@ line(
       room(height);
       const y = doc.y;
 
-      doc.font("Helvetica-Bold")
+      doc.font("Bold")
         .fontSize(8)
         .fillColor("#111111")
         .text(date(tx.atMs), 42, y);
 
-      doc.font("Helvetica")
+      doc.font("Body")
         .fontSize(8)
         .text(body, 42, y + 16, {
           width: width - 120
@@ -7987,14 +7984,14 @@ line(
         ? "Non rapproché"
         : `${tx.walletDelta >= 0 ? "+" : ""}${money(tx.walletDelta)}`;
 
-      doc.font("Helvetica-Bold")
+      doc.font("Bold")
         .fontSize(9)
         .text(delta, 42 + width - 115, y + 16, {
           width: 115,
           align: "right"
         });
 
-      doc.font("Helvetica")
+      doc.font("Body")
         .fontSize(7)
         .fillColor("#555555")
         .text(meta, 42, y + 16 + bodyHeight + 9, { width });
@@ -8020,7 +8017,7 @@ line(
       const bottom = doc.page.margins.bottom;
       doc.page.margins.bottom = 0;
 
-      doc.font("Helvetica")
+      doc.font("Body")
         .fontSize(8)
         .fillColor("#666666")
         .text(
@@ -8775,6 +8772,7 @@ app.get(
   })
 );
 
+})();
 
 const PORT = process.env.PORT || 3000;
 

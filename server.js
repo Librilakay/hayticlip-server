@@ -4388,47 +4388,73 @@ app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
       });
     };
 
-    app.post(
-      "/api/merchant/upload-image",
-      auth,
-      oneFile("file", async (req, res) => {
-        const user = await ref("users", req.user.uid).get();
 
-        C.fail(
-          user.exists && C.active(user.data()),
-          "Boutique inactive",
-          403
-        );
 
-        const kind = req.body.kind;
+app.post(
+  "/api/merchant/upload-image",
+  auth,
+  oneFile("file", async (req, res) => {
+    const user = await ref(
+      "users",
+      req.user.uid
+    ).get();
 
-        C.fail(
-          ["shop", "product"].includes(kind),
-          "Destination invalide"
-        );
-
-        const type = fileType(req.file);
-
-        const path =
-          `${kind === "shop" ? "shops" : "products"}/` +
-          `${req.user.uid}/${crypto.randomUUID()}.${type.ext}`;
-
-        const up = await supabase.storage
-          .from("media")
-          .upload(path, req.file.buffer, {
-            contentType: type.mime,
-            upsert: false
-          });
-
-        C.fail(!up.error, "Téléversement impossible", 503);
-
-        const url = supabase.storage
-          .from("media")
-          .getPublicUrl(path).data.publicUrl;
-
-        res.json({ success: true, url });
-      })
+    C.fail(
+      user.exists && C.active(user.data()),
+      "Boutique inactive",
+      403
     );
+
+    const kind = req.body.kind;
+
+    C.fail(
+      ["shop", "product"].includes(kind),
+      "Destination invalide"
+    );
+
+    const type = fileType(req.file);
+
+    const path =
+      (kind === "shop" ? "shops" : "products") +
+      "/" + req.user.uid +
+      "/" + crypto.randomUUID() +
+      "." + type.ext;
+
+    const storage = merchantMedia
+      .client()
+      .storage
+      .from("media");
+
+    const url = storage
+      .getPublicUrl(path)
+      .data.publicUrl;
+
+    await merchantMedia.stage(
+      req.user.uid,
+      kind,
+      path,
+      url
+    );
+
+    const up = await storage.upload(
+      path,
+      req.file.buffer,
+      {
+        contentType: type.mime,
+        upsert: false
+      }
+    );
+
+    C.fail(
+      !up.error,
+      "Téléversement impossible",
+      503
+    );
+
+    res.json({ success: true, url });
+  })
+);
+
 
     app.post(
       "/api/merchant/dispute-evidence",
@@ -4722,6 +4748,461 @@ app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
     maxRows
   };
 })();
+
+
+
+const merchantMedia = (() => {
+  const { C, run, ref, timestamp } = merchantOrdersV2;
+  const JOBS = "merchantMediaCleanup";
+  const erased = () => admin.firestore.FieldValue.delete();
+
+  let storageClient;
+  let running = false;
+
+  function client() {
+    if (storageClient) return storageClient;
+
+    const key =
+      process.env.SUPABASE_SECRET_KEY ||
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_KEY ||
+      "";
+
+    let serviceRole = false;
+
+    try {
+      serviceRole = JSON.parse(
+        Buffer.from(
+          key.split(".")[1] || "",
+          "base64url"
+        ).toString("utf8")
+      ).role === "service_role";
+    } catch {}
+
+    C.fail(
+      key.startsWith("sb_secret_") || serviceRole,
+      "Configure une clé serveur Supabase dans Render.",
+      503,
+      "STORAGE_SERVER_KEY_MISSING"
+    );
+
+    storageClient = createClient(
+      process.env.SUPABASE_URL,
+      key,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false
+        },
+        global: {
+          fetch: (url, options = {}) => fetch(url, {
+            ...options,
+            signal:
+              options.signal ||
+              AbortSignal.timeout(12000)
+          })
+        }
+      }
+    );
+
+    return storageClient;
+  }
+
+  function parse(value, uid, kind) {
+    let url;
+    let path;
+
+    try {
+      url = new URL(value);
+
+      const base = new URL(process.env.SUPABASE_URL);
+      const prefix = "/storage/v1/object/public/media/";
+
+      if (
+        url.origin !== base.origin ||
+        url.username ||
+        url.password ||
+        !url.pathname.startsWith(prefix)
+      ) {
+        throw new Error();
+      }
+
+      path = decodeURIComponent(
+        url.pathname.slice(prefix.length)
+      );
+
+      const parts = path.split("/");
+
+      if (
+        parts.length !== 3 ||
+        parts[0] !== (
+          kind === "shop" ? "shops" : "products"
+        ) ||
+        parts[1] !== uid ||
+        !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.(jpe?g|png|webp)$/i
+          .test(parts[2])
+      ) {
+        throw new Error();
+      }
+
+      url = new URL(
+        prefix + parts.map(encodeURIComponent).join("/"),
+        base.origin
+      );
+    } catch {
+      throw new C.MerchantError(
+        400,
+        "Photo non autorisée."
+      );
+    }
+
+    return {
+      path,
+      url: url.href,
+      uid,
+      kind,
+      id: C.sha("media:" + path)
+    };
+  }
+
+  async function stage(uid, kind, path, url) {
+    const image = parse(url, uid, kind);
+
+    C.fail(
+      image.path === path,
+      "Chemin de photo invalide."
+    );
+
+    await ref(JOBS, image.id).set({
+      ownerUid: uid,
+      kind,
+      path,
+      urls: [image.url],
+      state: "staged",
+      nextAttemptAtMs: Date.now() + 24 * 3600000,
+      attempts: 0,
+      createdAt: timestamp()
+    });
+  }
+
+  async function change(
+    tx,
+    uid,
+    oldUrls,
+    nextUrls,
+    kind
+  ) {
+    const previous = new Map();
+
+    for (const value of oldUrls.filter(Boolean)) {
+      try {
+        const image = parse(value, uid, kind);
+        image.original = value;
+        previous.set(image.path, image);
+      } catch {
+        // Seuls les chemins appartenant au marchand
+        // et reconnus par ce gestionnaire sont supprimables.
+      }
+    }
+
+    const unchanged = new Set(
+      oldUrls.filter(Boolean)
+    );
+
+    const normalized = nextUrls.map(value => {
+      try {
+        return parse(value, uid, kind);
+      } catch (error) {
+        if (!unchanged.has(value)) throw error;
+
+        return {
+          url: value,
+          legacy: true
+        };
+      }
+    });
+
+    const after = normalized.filter(
+      image => !image.legacy
+    );
+
+    const wanted = new Set(
+      after.map(image => image.path)
+    );
+
+    const all = new Map(previous);
+
+    for (const image of after) {
+      all.set(image.path, image);
+    }
+
+    const snapshots = new Map();
+
+    for (const image of all.values()) {
+      snapshots.set(
+        image.path,
+        await tx.get(ref(JOBS, image.id))
+      );
+    }
+
+    for (const image of after) {
+      const snap = snapshots.get(image.path);
+      const job = snap.exists ? snap.data() : {};
+
+      C.fail(
+        !["deleting", "deleted"].includes(job.state),
+        "Cette photo a été retirée. Sélectionne une nouvelle photo.",
+        409,
+        "IMAGE_RETIRED"
+      );
+
+      tx.set(ref(JOBS, image.id), {
+        ownerUid: uid,
+        kind,
+        path: image.path,
+        urls: [image.url],
+        state: "active",
+        nextAttemptAtMs: erased(),
+        leaseUntilMs: erased(),
+        token: erased(),
+        createdAt: job.createdAt || timestamp()
+      }, { merge: true });
+    }
+
+    for (const image of previous.values()) {
+      if (wanted.has(image.path)) continue;
+
+      const snap = snapshots.get(image.path);
+      const job = snap.exists ? snap.data() : {};
+
+      if (
+        ["deleting", "deleted"].includes(job.state)
+      ) {
+        continue;
+      }
+
+      tx.set(ref(JOBS, image.id), {
+        ownerUid: uid,
+        kind,
+        path: image.path,
+        urls: [...new Set([
+          image.url,
+          image.original,
+          ...(job.urls || [])
+        ])],
+        state: "queued",
+        nextAttemptAtMs: Date.now(),
+        attempts: job.attempts || 0,
+        createdAt: job.createdAt || timestamp()
+      }, { merge: true });
+    }
+
+    return normalized.map(image => image.url);
+  }
+
+  async function claim(id) {
+    return run(async tx => {
+      const jobRef = ref(JOBS, id);
+      const snap = await tx.get(jobRef);
+
+      if (!snap.exists) return null;
+
+      const job = snap.data();
+
+      if (
+        ["active", "deleted"].includes(job.state) ||
+        Number(job.nextAttemptAtMs || 0) > Date.now() ||
+        Number(job.leaseUntilMs || 0) > Date.now()
+      ) {
+        return null;
+      }
+
+      const image = parse(
+        job.urls?.[0],
+        job.ownerUid,
+        job.kind
+      );
+
+      C.fail(
+        image.path === job.path && image.id === id,
+        "Nettoyage de photo incohérent.",
+        409
+      );
+
+      const checks = [];
+
+      for (const url of job.urls || []) {
+        for (const field of [
+          "merchantLogo",
+          "merchantBanner",
+          "avatar",
+          "photoURL"
+        ]) {
+          checks.push(tx.get(
+            db.collection("users")
+              .where(field, "==", url)
+              .limit(1)
+          ));
+        }
+
+        checks.push(tx.get(
+          db.collection("merchantProducts")
+            .where("images", "array-contains", url)
+            .limit(1)
+        ));
+
+        checks.push(tx.get(
+          db.collection("merchantProducts")
+            .where("imageUrl", "==", url)
+            .limit(1)
+        ));
+
+        checks.push(tx.get(
+          db.collection("merchantOrders")
+            .where("productImage", "==", url)
+            .limit(1)
+        ));
+      }
+
+      const used = (
+        await Promise.all(checks)
+      ).some(snapshot => !snapshot.empty);
+
+      if (used) {
+        tx.update(jobRef, {
+          state: "referenced",
+          nextAttemptAtMs: Date.now() + 6 * 3600000,
+          leaseUntilMs: erased(),
+          token: erased()
+        });
+
+        return null;
+      }
+
+      const token = crypto.randomUUID();
+
+      tx.update(jobRef, {
+        state: "deleting",
+        token,
+        leaseUntilMs: Date.now() + 60000,
+        nextAttemptAtMs: Date.now() + 60000,
+        attempts: Number(job.attempts || 0) + 1
+      });
+
+      return { ...job, id, token };
+    });
+  }
+
+  async function finish(job, error) {
+    await run(async tx => {
+      const target = ref(JOBS, job.id);
+      const snap = await tx.get(target);
+
+      if (
+        !snap.exists ||
+        snap.data().token !== job.token
+      ) {
+        return;
+      }
+
+      tx.update(target, error ? {
+        state: "retry",
+        lastError: String(
+          error.message || error
+        ).slice(0, 300),
+        nextAttemptAtMs: Date.now() + Math.min(
+          3600000,
+          60000 * Math.max(
+            1,
+            Number(job.attempts || 0) + 1
+          )
+        ),
+        token: erased(),
+        leaseUntilMs: erased()
+      } : {
+        state: "deleted",
+        deletedAt: timestamp(),
+        nextAttemptAtMs: erased(),
+        lastError: erased(),
+        token: erased(),
+        leaseUntilMs: erased()
+      });
+    });
+  }
+
+  async function drain() {
+    if (running) return;
+
+    running = true;
+
+    try {
+      const storage = client().storage.from("media");
+
+      const due = await db.collection(JOBS)
+        .where("nextAttemptAtMs", "<=", Date.now())
+        .orderBy("nextAttemptAtMs")
+        .limit(12)
+        .get();
+
+      for (const snap of due.docs) {
+        let job;
+
+        try {
+          job = await claim(snap.id);
+
+          if (!job) continue;
+
+          const result = await storage.remove([
+            job.path
+          ]);
+
+          if (
+            result.error &&
+            String(result.error.statusCode) !== "404"
+          ) {
+            throw result.error;
+          }
+
+          await finish(job);
+        } catch (error) {
+          if (job) await finish(job, error);
+
+          console.error(
+            "MERCHANT_MEDIA_CLEANUP:",
+            error.message || "échec"
+          );
+        }
+      }
+    } finally {
+      running = false;
+    }
+  }
+
+  function kick() {
+    const timer = setTimeout(() => {
+      drain().catch(error => console.error(
+        "MERCHANT_MEDIA_CLEANUP:",
+        error.message
+      ));
+    }, 0);
+
+    timer.unref?.();
+  }
+
+  const timer = setInterval(kick, 60000);
+  timer.unref?.();
+  kick();
+
+  return {
+    client,
+    parse,
+    stage,
+    change,
+    kick,
+    drain
+  };
+})();
+
 
 
 app.post(
@@ -7211,25 +7692,44 @@ pdf(data, supabase, res) {
       "RECONCILIATION_REQUIRED"
     );
 
-    const PDFDocument = require("pdfkit");
-
-    const doc = new PDFDocument({
-      size: "A4",
-      margin: 42,
-      bufferPages: true,
-      info: {
-        Title: `Rapport ${data.shop.name}`,
         Author: "HaytiClips"
       }
     });
 
-    const chunks = [];
 
-    const finished = new Promise((resolve, reject) => {
-      doc.on("data", chunk => chunks.push(chunk));
-      doc.on("end", () => resolve(Buffer.concat(chunks)));
-      doc.on("error", reject);
-    });
+const PDFDocument = require("pdfkit");
+
+const regularFont = require.resolve(
+  "@fontsource/noto-sans/files/noto-sans-latin-400-normal.woff"
+);
+
+const boldFont = require.resolve(
+  "@fontsource/noto-sans/files/noto-sans-latin-700-normal.woff"
+);
+
+const doc = new PDFDocument({
+  size: "A4",
+  margin: 42,
+  bufferPages: true,
+  font: regularFont,
+  info: {
+    Title: `Rapport ${data.shop.name}`,
+    Author: "HaytiClips"
+  }
+});
+
+doc.registerFont("Body", regularFont);
+doc.registerFont("Bold", boldFont);
+
+const chunks = [];
+
+const finished = new Promise((resolve, reject) => {
+  doc.on("data", chunk => chunks.push(chunk));
+  doc.on("end", () => resolve(Buffer.concat(chunks)));
+  doc.on("error", reject);
+});
+
+finished.catch(() => {});
 
     const money = value =>
       new Intl.NumberFormat("fr-HT", {
@@ -7248,13 +7748,13 @@ pdf(data, supabase, res) {
 
     function header() {
       doc.fillColor("#ff0050")
-        .font("Helvetica-Bold")
+        .font("Bold")
         .fontSize(19)
         .text("HaytiClips | Rapport marchand");
 
       doc.moveDown(0.4)
         .fillColor("#222222")
-        .font("Helvetica")
+        .font("Body")
         .fontSize(9)
         .text(
           `${data.shop.name} - ${data.range.from} au ${data.range.to}`
@@ -7274,12 +7774,12 @@ pdf(data, supabase, res) {
       room(25);
       const y = doc.y;
 
-      doc.font("Helvetica")
+      doc.font("Body")
         .fontSize(10)
         .fillColor("#333333")
         .text(label, 42, y, { width: width * 0.63 });
 
-      doc.font("Helvetica-Bold")
+      doc.font("Bold")
         .text(value, 42 + width * 0.63, y, {
           width: width * 0.37,
           align: "right"
@@ -7607,7 +8107,6 @@ line(
           name: user.merchantShopName || "",
           bio: user.merchantBio || "",
           logo: user.merchantLogo || "",
-          banner: user.merchantBanner || "",
           email: user.merchantEmail || user.email || "",
           phone: user.merchantPhone || "",
           whatsapp: user.merchantWhatsapp || "",
@@ -7668,33 +8167,17 @@ app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
       "Email invalide."
     );
 
-    function ownMedia(value) {
-      let url;
 
-      try {
-        url = new URL(value);
-      } catch {
-        throw new C.MerchantError(
-          400,
-          "Image de boutique invalide."
-        );
-      }
+if (body.logo) {
+  fields.merchantLogo = merchantMedia.parse(
+    body.logo,
+    req.user.uid,
+    "shop"
+  ).url;
+}
 
-      const base = new URL(process.env.SUPABASE_URL);
-
-      C.fail(
-        url.origin === base.origin &&
-        url.pathname.startsWith(
-          `/storage/v1/object/public/media/shops/${req.user.uid}/`
-        ),
-        "Image de boutique invalide."
-      );
-
-      return url.href;
-    }
-
-    if (body.logo) fields.merchantLogo = ownMedia(body.logo);
-    if (body.banner) fields.merchantBanner = ownMedia(body.banner);
+fields.merchantBanner =
+  admin.firestore.FieldValue.delete();
 
     const hasRates = Object.prototype.hasOwnProperty.call(
       body,
@@ -7769,6 +8252,20 @@ app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
         }
       }
 
+
+await merchantMedia.change(
+  tx,
+  req.user.uid,
+  [
+    user.merchantLogo,
+    user.merchantBanner
+  ],
+  [
+    fields.merchantLogo || user.merchantLogo
+  ].filter(Boolean),
+  "shop"
+);
+
       tx.update(ref("users", req.user.uid), changes);
 
       return {
@@ -7780,6 +8277,7 @@ app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
       };
     });
 
+   merchantMedia.kick();
     res.json(result);
   }));
 
@@ -7817,7 +8315,6 @@ app.post("/api/merchant/save-shop", auth, wrap(async (req, res) => {
       shop: {
         name: data.merchantShopName || data.username,
         logo: data.merchantLogo || data.avatar || "",
-        banner: data.merchantBanner || "",
         bio: data.merchantBio || "",
         email: data.merchantEmail || "",
         phone: data.merchantPhone || "",
@@ -7948,14 +8445,27 @@ zones: data.merchantDeliveryZones || "",
         "État produit invalide"
       );
 
+
+const images = await merchantMedia.change(
+  tx,
+  uid,
+  [
+    ...(previous.data()?.images || []),
+    previous.data()?.imageUrl
+  ],
+  data.images,
+  "product"
+);
+
       tx.set(productRef, {
         merchantUid: uid,
         name,
         description,
         price,
         stock: data.stock,
-        images: data.images,
-        imageUrl: data.images[0],
+
+images,
+imageUrl: images[0],
         isActive: data.isActive,
         archived: false,
         version: Number(previous.data()?.version || 0) + 1,
@@ -7966,13 +8476,19 @@ zones: data.merchantDeliveryZones || "",
       });
     });
 
+ merchantMedia.kick();
+
     res.json({
       success: true,
       productId: productRef.id
     });
   }));
 
-  app.post("/api/merchant/archive-product", auth, wrap(async (req, res) => {
+
+app.post(
+  "/api/merchant/archive-product",
+  auth,
+  wrap(async (req, res) => {
     await run(async tx => {
       C.fail(
         C.active(await getUser(tx, req.user.uid)),
@@ -7994,16 +8510,35 @@ zones: data.merchantDeliveryZones || "",
         404
       );
 
+      await merchantMedia.change(
+        tx,
+        req.user.uid,
+        [
+          ...(product.data().images || []),
+          product.data().imageUrl
+        ],
+        [],
+        "product"
+      );
+
       tx.update(productRef, {
         isActive: false,
         archived: true,
-        archivedAt: timestamp(),
-        version: Number(product.data().version || 0) + 1
+        images: [],
+        imageUrl: "",
+        archivedAt:
+          product.data().archivedAt ||
+          timestamp(),
+        version:
+          Number(product.data().version || 0) + 1
       });
     });
 
+    merchantMedia.kick();
+
     res.json({ success: true });
-  }));
+  })
+);
 
   app.get("/api/merchant/admin/overview", auth, wrap(async (req, res) => {
     const staff = await ref("users", req.user.uid).get();
@@ -8199,16 +8734,46 @@ zones: data.merchantDeliveryZones || "",
     res.json(data);
   }));
 
-  app.get("/api/merchant/report.pdf", auth, wrap(async (req, res) => {
-    const data = await merchantReportsV2.summary(
-      reportOptions,
-      req.user.uid,
-      req.query
-    );
+app.get(
+  "/api/merchant/report.pdf",
+  auth,
+  wrap(async (req, res) => {
+    try {
+      const data = await merchantReportsV2.summary(
+        reportOptions,
+        req.user.uid,
+        req.query
+      );
 
-    await merchantReportsV2.pdf(data, supabase, res);
-  }));
-})();
+      await merchantReportsV2.pdf(
+        data,
+        supabase,
+        res
+      );
+    } catch (error) {
+      if (error.status) throw error;
+
+      const reference = crypto
+        .randomUUID()
+        .slice(0, 8);
+
+      console.error(
+        "MERCHANT_PDF " + reference,
+        error.stack || error.message || error
+      );
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error:
+            "Rapport PDF indisponible. Référence : " +
+            reference,
+          code: "PDF_GENERATION_FAILED"
+        });
+      }
+    }
+  })
+);
 
 
 const PORT = process.env.PORT || 3000;

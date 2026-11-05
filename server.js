@@ -26,39 +26,59 @@ const app = express();
 
 
 // ================= MOTEUR DE NOTIFICATIONS PUSH =================
-async function sendPushNotification(targetUid, title, body, extraData = {}) {
+
+async function sendPushNotification(
+  targetUid,
+  title,
+  body,
+  extraData = {},
+  { giftWebPush = false } = {}
+) {
   try {
-    const userDoc = await admin.firestore().collection("users").doc(targetUid).get();
-    if (!userDoc.exists) return;
+    const userDoc = await admin.firestore()
+      .collection("users")
+      .doc(targetUid)
+      .get();
 
     const token = userDoc.data()?.fcmToken;
+
     if (!token) {
-      console.log(`Pas de token FCM pour l'utilisateur ${targetUid}`);
+      console.log("PUSH: aucun token enregistré pour le destinataire.");
       return;
     }
 
-    // 🔥 MODIFICATION : Forcer toutes les valeurs de data en String
     const safeData = {};
-    if (extraData) {
-      for (const key in extraData) {
-        if (extraData[key] !== undefined && extraData[key] !== null) {
-          safeData[key] = String(extraData[key]);
-        }
+
+    for (const [key, value] of Object.entries(extraData || {})) {
+      if (value !== undefined && value !== null) {
+        safeData[key] = String(value);
       }
     }
 
-    const message = {
-      token: token,
-      notification: { title: title, body: body },
-      data: safeData
-    };
+    const message = giftWebPush
+      ? {
+          token,
+          data: {
+            ...safeData,
+            hcPushKind: "gift-v1",
+            pushTitle: String(title),
+            pushBody: String(body)
+          }
+        }
+      : {
+          token,
+          notification: { title, body },
+          data: safeData
+        };
 
     const response = await admin.messaging().send(message);
+
     console.log("Notification Push envoyée :", response);
   } catch (error) {
-    console.error("Erreur envoi notification Push :", error);
+    console.error("PUSH_ERROR:", error.code || error.message);
   }
 }
+
 // ================================================================
 
 
@@ -682,12 +702,18 @@ app.post("/api/sendGift", giftLimiter, verifyFirebaseToken, async (req,res)=>{
     // --- DÉCLENCHEUR PUSH CADEAU (Utilise senderSnap déjà défini plus haut) ---
     const senderUsername = senderSnap.data()?.username || "Un utilisateur";
 
-    await sendPushNotification(
-      creatorId,
-      "Nouveau Cadeau ! 🎁",
-      `${senderUsername} vous a envoyé un cadeau d'une valeur de ${giftAmount} !`,
-      { type: "gift", amount: String(giftAmount) }
-    );
+
+await sendPushNotification(
+  creatorId,
+  "Nouveau cadeau 🎁",
+  `${senderUsername} t’a envoyé un cadeau de ${giftAmount} HTG !`,
+  {
+    type: "gift",
+    amount: giftAmount,
+    videoId
+  },
+  { giftWebPush: true }
+);
 
     res.json({ success: true });
 

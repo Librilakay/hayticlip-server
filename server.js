@@ -2745,12 +2745,22 @@ codecs, publicOrder,
 
   const ref = (name, key) => db.collection(name).doc(key);
 
-  const run = fn => db.runTransaction(async real => {
-    const tx = new Staged(real);
-    const out = await fn(tx);
-    tx.flush();
-    return out;
-  });
+const run = async fn => {
+    const committed = await db.runTransaction(async real => {
+      const tx = new Staged(real);
+      const result = await fn(tx);
+      tx.flush();
+
+      return { result, pushes: tx.afterCommitPushes || [] };
+    });
+
+    for (const push of committed.pushes) {
+      void sendAppPush(push);
+    }
+
+    return committed.result;
+  };
+
 
   const maxRows = Number(
     process.env.MERCHANT_REPORT_MAX_ROWS || 10000

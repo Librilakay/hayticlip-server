@@ -60,7 +60,7 @@ async function sendPushNotification(
           token,
           data: {
             ...safeData,
-            hcPushKind: giftWebPush ? "git-v1" : "event-v1",
+            hcPushKind: giftWebPush ? "gift-v1" : "event-v1",
             pushTitle: String(title),
             pushBody: String(body)
           }
@@ -872,28 +872,69 @@ function getLocalDateString(date = new Date()) {
 
 
 // ROUTE POUR SAUVEGARDER LE TOKEN DU TÉLÉPHONE
+
 app.post("/api/save-fcm-token", verifyFirebaseToken, async (req, res) => {
+  const uid = req.user.uid;
+  const rawToken = req.body?.fcmToken;
+  const fcmToken = typeof rawToken === "string" ? rawToken.trim() : "";
+
+  if (!fcmToken || fcmToken.length > 4096 || /\s/.test(fcmToken)) {
+    console.warn("FCM_SAVE_INVALID", { uid });
+
+    return res.status(400).json({
+      success: false,
+      code: "FCM_TOKEN_INVALID",
+      error: "Jeton FCM invalide ou manquant."
+    });
+  }
+
+  const fingerprint = value =>
+    crypto.createHash("sha256").update(value).digest("hex").slice(0, 12);
+
   try {
-    const uid = req.user.uid;
-    const { fcmToken } = req.body;
+    const userRef = db.collection("users").doc(uid);
 
-    if (!fcmToken || typeof fcmToken !== "string") {
-      return res.status(400).json({ error: "Token FCM invalide ou manquant" });
-    }
+    const saved = await db.runTransaction(async tx => {
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) return null;
 
-    await db.collection("users").doc(uid).update({
-      fcmToken: fcmToken,
-      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+      const value = userSnap.data()?.fcmToken;
+      const before = typeof value === "string" && value ? value : null;
+
+      tx.update(userRef, {
+        fcmToken,
+        fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return {
+        status: before === fcmToken ? "unchanged" : before ? "replaced" : "registered",
+        before: before ? fingerprint(before) : null,
+        after: fingerprint(fcmToken)
+      };
     });
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("Erreur sauvegarde token :", e);
-    res.status(500).json({ error: e.message });
+    if (!saved) {
+      console.warn("FCM_SAVE_PROFILE_MISSING", { uid });
+
+      return res.status(404).json({
+        success: false,
+        code: "FCM_PROFILE_NOT_FOUND",
+        error: "Profil Firestore introuvable."
+      });
+    }
+
+    console.info("FCM_SAVE_OK", { uid, ...saved });
+    return res.json({ success: true, status: saved.status });
+  } catch (error) {
+    console.error("FCM_SAVE_FAILED", { uid, code: error.code || "unknown" });
+
+    return res.status(500).json({
+      success: false,
+      code: "FCM_SAVE_FAILED",
+      error: "Impossible d’enregistrer le jeton push."
+    });
   }
 });
-
-
 
 
 

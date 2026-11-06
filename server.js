@@ -32,7 +32,7 @@ async function sendPushNotification(
   title,
   body,
   extraData = {},
-  { giftWebPush = false } = {}
+  { giftWebPush = false, eventWebPush = false } = {}
 ) {
   try {
     const userDoc = await admin.firestore()
@@ -55,12 +55,12 @@ async function sendPushNotification(
       }
     }
 
-    const message = giftWebPush
+    const message = (giftWebPush || eventWebPush)
       ? {
           token,
           data: {
             ...safeData,
-            hcPushKind: "gift-v1",
+            hcPushKind: giftWebPush ? "git-v1" : "event-v1",
             pushTitle: String(title),
             pushBody: String(body)
           }
@@ -410,25 +410,161 @@ async function moncashPrefundedTransactionStatus(reference) {
 
 
 // ROUTE RELAIS POUR LES PUSHS DEPUIS LE FRONTEND
+
+
+function sendAppPush({ to, title, body, type, ...data }) {
+  return sendPushNotification(
+    to, title, body, { ...data, type }, { eventWebPush: true }
+  );
+}
+
+function validPushId(value) {
+  return typeof value === "string" &&
+    value.length > 0 && value.length <= 128 &&
+    !/[\/\x00-\x1f\x7f]/.test(value) &&
+    value !== "." && value !== "..";
+}
+
 app.post("/api/send-push", verifyFirebaseToken, async (req, res) => {
+  const { notificationId, commentId, replyId } = req.body || {};
+  const from = req.user.uid;
+
+  if (!validPushId(from) || !validPushId(notificationId)) {
+    return res.status(400).json({
+      success: false,
+      error: "Identifiant de notification requis."
+    });
+  }
+
   try {
-    const { targetUid, title, body, extraData } = req.body;
+    const push = await db.runTransaction(async tx => {
+      const snap = await tx.get(db.doc("notifications/" + notificationId));
+      const n = snap.data();
+      const now = Date.now();
+      const noticeAt = snap.createTime?.toMillis() || 0;
 
-    if (!targetUid || !title || !body) {
-      return res.status(400).json({ error: "Données manquantes pour le push" });
-    }
+      if (
+        !n || n.from !== from || !validPushId(n.to) || n.to === from ||
+        !["follow", "like", "comment", "reply"].includes(n.type) ||
+        noticeAt < now - 5 * 60000 || noticeAt > now + 5000
+      ) return null;
 
-    // On utilise la fonction sendPushNotification globale que tu as déjà créée sur le serveur
-    await sendPushNotification(targetUid, title, body, extraData);
+      const [sender, receiver] = await Promise.all([
+        tx.get(db.doc("users/" + from)),
+        tx.get(db.doc("users/" + n.to))
+      ]);
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("ERREUR ROUTE SEND-PUSH:", e);
-    res.status(500).json({ error: e.message });
+      if (
+        !sender.exists || sender.data().suspended === true ||
+        !receiver.data()?.fcmToken || receiver.data().suspended === true
+      ) return null;
+
+      const name = String(sender.data().username || "Un utilisateur")
+        .trim().slice(0, 60) || "Un utilisateur";
+
+      const isRecent = doc => {
+        const created = doc.createTime?.toMillis() || 0;
+        return doc.exists && created <= noticeAt && created >= noticeAt - 120000;
+      };
+
+      let guardKey;
+      let delay;
+      let event;
+
+      if (n.type === "follow") {
+        const [following, follower] = await Promise.all([
+          tx.get(db.doc("users/" + from + "/following/" + n.to)),
+          tx.get(db.doc("users/" + n.to + "/followers/" + from))
+        ]);
+
+        if (
+          !isRecent(following) || !isRecent(follower) ||
+          following.data().uid !== n.to || follower.data().uid !== from
+        ) return null;
+
+        guardKey = ["follow", from, n.to];
+        delay = 24 * 60 * 60000;
+        event = {
+          title: "Nouvel abonnement",
+          body: name + " s’est abonné à toi.",
+          uid: from
+        };
+      } else {
+        if (!validPushId(n.videoId)) return null;
+
+        const path = "videos/" + n.videoId;
+        const video = (await tx.get(db.doc(path))).data();
+
+        if (!video || video.archived !== false || video.moderationStatus !== "clean") {
+          return null;
+        }
+
+        if (n.type === "like") {
+          if (video.userId !== n.to) return null;
+
+          const like = await tx.get(db.doc(path + "/likes/" + from));
+          if (!isRecent(like) || like.data().uid !== from) return null;
+
+          guardKey = ["like", n.videoId, n.to];
+          delay = 10 * 60000;
+          event = {
+            title: "Nouveau like ❤️",
+            body: name + " a aimé ta vidéo."
+          };
+        } else {
+          if (!validPushId(commentId)) return null;
+
+          const commentPath = path + "/comments/" + commentId;
+          const comment = await tx.get(db.doc(commentPath));
+          let proof = comment;
+
+          if (n.type === "reply") {
+            if (!validPushId(replyId) || comment.data()?.uid !== n.to) {
+              return null;
+            }
+
+            proof = await tx.get(db.doc(commentPath + "/replies/" + replyId));
+          } else if (video.userId !== n.to) {
+            return null;
+          }
+
+          if (!isRecent(proof) || proof.data().uid !== from) return null;
+
+          guardKey = [
+            n.type, proof.ref.path,
+            proof.createTime.seconds, proof.createTime.nanoseconds
+          ];
+          delay = 10 * 60000;
+          event = n.type === "reply"
+            ? { title: "Nouvelle réponse 💬", body: name + " a répondu à ton commentaire." }
+            : { title: "Nouveau commentaire 💬", body: name + " a commenté ta vidéo." };
+        }
+
+        event.videoId = n.videoId;
+      }
+
+      const hash = crypto.createHash("sha256")
+        .update(JSON.stringify(guardKey))
+        .digest("hex");
+
+      const guardRef = db.doc("serverPushGuards/" + hash);
+      const guard = await tx.get(guardRef);
+
+      if ((guard.data()?.untilMs || 0) > now) return null;
+
+      tx.set(guardRef, { untilMs: now + delay });
+
+      return { to: n.to, type: n.type, ...event };
+    });
+
+    if (push) await sendAppPush(push);
+
+    res.json({ success: true, requested: Boolean(push) });
+  } catch (error) {
+    console.error("SOCIAL_PUSH:", error.code || error.message);
+    res.status(500).json({ success: false, error: "Push indisponible." });
   }
 });
-
-
 
 // ROUTE ENVOI CADEAU
 app.post("/api/sendGift", giftLimiter, verifyFirebaseToken, async (req,res)=>{
@@ -2652,7 +2788,30 @@ codecs, publicOrder,
         createdAt: timestamp()
       }
     );
+
+if (type === "merchant_order") {
+  (tx.afterCommitPushes ??= []).push({
+    to: uid,
+    type: "merchant_order",
+    title: "Nouvelle commande 🛍️",
+    body: "Tu as reçu une commande à préparer.",
+    orderId: extra.orderId
+  });
+}
+
+if (type === "merchant_order_update" && extra.event === "order_accepted") {
+  (tx.afterCommitPushes ??= []).push({
+    to: uid,
+    type: "merchant_order_accepted",
+    title: "Commande acceptée ✅",
+    body: "Le marchand a accepté ta commande.",
+    merchantUid: actor,
+    orderId: extra.orderId
+  });
+}
+
   }
+
 
   async function finance(tx, type, incoming, outgoing) {
     if (!tx.financeState) {
@@ -3731,16 +3890,20 @@ app.post("/api/merchant/buy-product", auth, wrap(async (req, res) => {
                 ? "Votre commande est en livraison."
                 : "Votre commande a été acceptée et sera préparée.";
 
-        notify(
-          tx,
-          order.buyerUid,
-          req.user.uid,
-          "merchant_order_update",
-          message,
-          `${orderId}:${kind}`,
-          { orderId }
-        );
 
+
+notify(
+  tx,
+  order.buyerUid,
+  req.user.uid,
+  "merchant_order_update",
+  message,
+  `${orderId}:${kind}`,
+  {
+    orderId,
+    ...(kind === "accept" ? { event: "order_accepted" } : {})
+  }
+);
         ledger.flush();
 
         return { success: true };
@@ -6057,14 +6220,22 @@ app.get("/", (req, res) => {
   const ref = (collection, id) =>
     db.collection(collection).doc(id);
 
-  const run = fn =>
-    db.runTransaction(async real => {
-      const t = new Staged(real);
-      const result = await fn(t);
-      t.flush();
-      return result;
-    });
 
+
+const run = async fn => {
+  const committed = await db.runTransaction(async real => {
+    const tx = new Staged(real);
+    const result = await fn(tx);
+    tx.flush();
+    return { result, pushes: tx.afterCommitPushes || [] };
+  });
+
+  for (const push of committed.pushes) {
+    void sendAppPush(push);
+  }
+
+  return committed.result;
+};
   const wrap = fn => async (req, res) => {
     try {
       await fn(req, res);

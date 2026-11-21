@@ -1,8 +1,6 @@
 require("dotenv").config();
 
 console.log("START SERVER");
-console.log("ADMIN_UID:", process.env.ADMIN_UID);
-console.log("FIREBASE RAW:", process.env.FIREBASE_SERVICE_ACCOUNT ? process.env.FIREBASE_SERVICE_ACCOUNT.slice(0, 50) : "MISSING");
 
 
 
@@ -95,6 +93,11 @@ max: 100
 app.use("/api/", apiLimiter);
 
 
+app.post(
+  "/api/tranzak/webhook",
+  bodyParser.raw({ type: "application/json", limit: "64kb", inflate: false }),
+  receiveTranzakWebhook
+);
 
 //  SOLUTION : Utiliser bodyParser au lieu de express.json()
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -219,31 +222,32 @@ const MONCASH_CLIENT_SECRET = process.env.MONCASH_CLIENT_SECRET || "TON_CLIENT_S
 // ⚠️ remplace par ton vrai domaine backend en production
 const APP_BASE_URL = process.env.APP_BASE_URL || "http://172.20.10.2:3000";
 
-async function verifyFirebaseToken(req,res,next){
 
-try{
 
-const authHeader = req.headers.authorization || "";
-if(!authHeader.startsWith("Bearer ")){
-return res.status(401).json({error:"missing token"});
+async function verifyFirebaseToken(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "missing token" });
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: "missing token" });
+  }
+
+  try {
+    req.user = await admin.auth().verifyIdToken(token, true);
+  } catch (e) {
+    console.warn("AUTH_TOKEN_ERROR", e.code || "unknown");
+    return res.status(401).json({ error: "invalid token" });
+  }
+
+  return next();
 }
 
+// CALCUL CADEAUX
 
-const token = authHeader.replace("Bearer ","").trim();
-const decoded = await admin.auth().verifyIdToken(token);
-
-req.user = decoded;
-
-next();
-
-}catch(e){
-
-console.log("TOKEN ERROR:", e);
-
-return res.status(401).json({error:"invalid token"});
-}
-
-}// CALCUL CADEAUX
 function calculateGift(amount){
 
 const allowed = [25,50,100,250,500,1000];
@@ -1078,165 +1082,475 @@ res.status(500).json({error:e.message});
 
 
 
-/* ================= WALLET RECHARGE ================= */
-app.post("/api/requestRecharge", verifyFirebaseToken, async (req,res)=>{
-  try{
-    const uid = req.user.uid;
-    const amount = Number(req.body.amount);
+const TW_AMOUNTS = [50, 100, 250, 500, 1000, 5000, 10000];
+const twIdOK = id => typeof id === "string" && /^\d{1,32}$/.test(id);
+const twRail = value => value === "moncash" || value === "natcash";
+const twUser = uid => db.collection("users").doc(uid);
+const twState = (uid, mode) => db.collection("tranzakWallets").doc(mode + "_" + uid);
+const twOp = id => db.collection("tranzakRecharges").doc(id);
+const twHistory = id => db.collection("walletTransactions").doc(id);
+const twStamp = () => admin.firestore.FieldValue.serverTimestamp();
+const twNext = mode => mode === "live" ? "liveCheckAtMs" : "testCheckAtMs";
+const twSavedRail = state => state?.network === "natcash" ? "natcash" : "moncash";
+const twRefOK = value => typeof value === "string" && /^HC[TL]_[a-f0-9]{32}$/.test(value);
 
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
+function twAssert(ok, status, message) {
+  if (!ok) throw Object.assign(new Error(message), { status, twStatus: status });
+}
 
-    if(!userSnap.exists){
-      return res.status(404).json({error:"User not found"});
-    }
-
-    const user = userSnap.data() || {};
-
-    if(user.suspended === true){
-      return res.status(403).json({error:"Compte suspendu"});
-    }
-
-    const allowed = [50,100,250,500,1000,5000,10000];
-
-    if(!allowed.includes(amount)){
-      return res.status(400).json({error:"Montant invalide"});
-    }
-
-    const pending = await db.collection("walletTransactions")
-      .where("userId","==",uid)
-      .where("type","==","deposit")
-      .where("status","==","pending")
-      .limit(1)
-      .get();
-
-    if(!pending.empty){
-      return res.status(400).json({error:"Une recharge est déjà en cours"});
-    }
-
-    const txRef = db.collection("walletTransactions").doc();
-    const orderId = makeOrderId("DEP");
-
-    await txRef.set({
-      userId: uid,
-      amount,
-      type: "deposit",
-      method: "moncash",
-      status: "pending",
-      orderId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+function twRoute(fn) {
+  return (req, res) => Promise.resolve().then(() => {
+    res.set("Cache-Control", "no-store");
+    return fn(req, res);
+  }).catch(e => {
+    if (!e.twStatus) console.error("TRANZAK_WALLET", e.code || e.name);
+    if (!res.headersSent) res.status(e.twStatus || 503).json({
+      success: false,
+      error: e.twStatus ? e.message : "Vérifie le statut avant de réessayer."
     });
+  });
+}
 
-    const payment = await moncashCreatePayment(amount, orderId);
+function twConfig() {
+  const key = (process.env.TRANZAK_API_KEY || "").trim();
+  const secret = (process.env.TRANZAK_WEBHOOK_SECRET || "").trim();
+  if (!/^tk_(test|live)_[A-Za-z0-9_-]+$/.test(key) || !/^whsec_\S+$/.test(secret)) return null;
+  return { key, secret, mode: key.startsWith("tk_live_") ? "live" : "test" };
+}
 
-    await txRef.update({
-      paymentToken: payment.token,
-      redirectUrl: payment.redirectUrl
-    });
+function twAllowed(cfg, uid) {
+  if (!cfg) return false;
+  const name = cfg.mode === "live" ? "TRANZAK_LIVE_UIDS" : "TRANZAK_TEST_UIDS";
+  const list = (process.env[name] || "").split(",").map(x => x.trim());
+  return uid === ADMIN_UID || list.includes(uid) || (cfg.mode === "live" && list.includes("*"));
+}
 
-    res.json({
-      success: true,
-      txId: txRef.id,
-      orderId,
-      redirectUrl: payment.redirectUrl
-    });
+function twAccess(req) {
+  const cfg = twConfig();
+  twAssert(twAllowed(cfg, req.user.uid), 403, "Recharge automatique indisponible pour ce compte.");
+  twAssert(req.body?.mode === cfg.mode, 409, "Le mode a changé. Actualise la page.");
+  return cfg;
+}
 
-  }catch(e){
-console.log("RECHARGE ERROR FULL:");
-console.log("STATUS:", e.response?.status);
-console.log("DATA:", e.response?.data);
-console.log("MESSAGE:", e.message);
-    res.status(500).json({error:"Impossible de démarrer la recharge"});
+function twNatNumber() {
+  const n = (process.env.NATCASH_MANUAL_NUMBER || "").trim();
+  return /^\+?509\d{8}$/.test(n) ? "+" + n.replace(/^\+/, "") : null;
+}
+
+const twToday = () => new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Port-au-Prince", year: "numeric", month: "2-digit", day: "2-digit"
+}).format(new Date());
+
+function twManualCount(data) {
+  const count = data.manualWithdrawDay === twToday() ? data.manualWithdrawCount : 0;
+  return Number.isSafeInteger(count) && count >= 0 ? count : 2;
+}
+
+function twManualFee(amount) {
+  for (const [max, fee] of [
+    [999, 15], [1999, 30], [3999, 40], [7999, 60], [11999, 65],
+    [19999, 75], [39999, 80], [59999, 115], [74999, 130]
+  ]) if (amount <= max) return fee;
+  return 150;
+}
+
+function twHaitiNumber(value) {
+  const n = typeof value === "string" ? value.replace(/[ .()-]/g, "") : "";
+  if (/^\d{8}$/.test(n)) return "+509" + n;
+  return /^\+?509\d{8}$/.test(n) ? "+" + n.replace(/^\+/, "") : null;
+}
+
+function twOperatorRef(value) {
+  const ref = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return /^[A-Z0-9][A-Z0-9._:/-]{3,79}$/.test(ref) ? ref : null;
+}
+
+let twReceiptClient;
+function twReceipts() {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  twAssert(key, 503, "Stockage des reçus indisponible.");
+  twReceiptClient ||= createClient(process.env.SUPABASE_URL, key, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  return twReceiptClient.storage.from("manual-receipts");
+}
+
+function twReceiptMime(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 12) return null;
+  if (bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "image/png";
+  if (bytes.subarray(0, 3).toString("hex") === "ffd8ff") return "image/jpeg";
+  if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
+    return "image/webp";
   }
+  return null;
+}
+
+app.get("/api/admin/manual-receipt/:transferId", verifyFirebaseToken, twRoute(async (req, res) => {
+  const u = (await twUser(req.user.uid).get()).data();
+  twAssert(u?.role === "admin" && u.suspended !== true, 403, "Accès refusé.");
+  const id = req.params.transferId;
+  twAssert(/^[A-Za-z0-9_-]{1,128}$/.test(id), 400, "Identifiant invalide.");
+  const x = (await db.collection("manualTransfers").doc(id).get()).data();
+  twAssert(
+    x?.type === "deposit" && x.status === "pending" && x.receiptStorage === "private-v1" &&
+    typeof x.receiptFileName === "string" && x.receiptFileName.startsWith(`receipts/${x.userId}/`),
+    404, "Reçu introuvable."
+  );
+  const signed = await twReceipts().createSignedUrl(x.receiptFileName, 60);
+  twAssert(!signed.error && signed.data?.signedUrl, 503, "Reçu indisponible.");
+  res.json({ success: true, url: signed.data.signedUrl });
+}));
+
+async function twManualGuard(t, uid, method, existing = false) {
+  const ref = twState(uid, "live");
+  const snap = t ? await t.get(ref) : await ref.get();
+  twAssert(twRail(method) && method === twSavedRail(snap.data()), 409,
+    "Le transfert doit utiliser le réseau enregistré.");
+  twAssert(existing || method !== "natcash" || twNatNumber(), 503, "Le manuel NatCash n’est pas activé.");
+}
+
+function twUserOpen(u) {
+  twAssert(!u.suspended && !u.frozenWallet && !u.depositBlocked, 403, "Recharge bloquée.");
+}
+
+function twPending(uid, col, depositOnly = false) {
+  let q = db.collection(col).where("userId", "==", uid).where("status", "==", "pending");
+  if (depositOnly) q = q.where("type", "==", "deposit");
+  return q.limit(1);
+}
+
+function twCheckout(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" && !u.username && !u.password && !u.port &&
+      (u.hostname === "tranzak.co" || u.hostname.endsWith(".tranzak.co") ||
+       ["moncashbutton.digicelgroup.com", "sandbox.moncashbutton.digicelgroup.com"].includes(u.hostname))
+      ? u.href : null;
+  } catch { return null; }
+}
+
+function twPublic(op) {
+  return op ? {
+    id: op.id, network: op.network, amount: op.amount, status: op.status,
+    redirectUrl: op.status === "pending" ? op.redirectUrl || null : null
+  } : null;
+}
+
+let twBackoffUntil = 0;
+
+async function twApi(cfg, method, path, data) {
+  if (Date.now() < twBackoffUntil) {
+    throw Object.assign(new Error("Réessaie dans un instant."), { twStatus: 429, refused: true });
+  }
+
+  const r = await axios({
+    method, url: "https://api.tranzak.co/api/gateway/v1" + path, data,
+    timeout: 6500, maxRedirects: 0, validateStatus: () => true,
+    headers: { "X-Api-Key": cfg.key, Accept: "application/json", "Content-Type": "application/json" }
+  });
+
+  if (r.status === 429) {
+    const seconds = Number(r.headers?.["retry-after"] || r.data?.retry_after || 60);
+    twBackoffUntil = Date.now() + 1000 * (Number.isFinite(seconds) ? Math.min(3600, Math.max(15, seconds)) : 60);
+    throw Object.assign(new Error("Réessaie dans un instant."), { twStatus: 429, refused: true });
+  }
+
+  if (r.status === 404 && r.data?.error === "transaction_not_found") return null;
+  if ([401, 403].includes(r.status)) twBackoffUntil = Date.now() + 10 * 60000;
+
+  if (r.status < 200 || r.status >= 300 || r.data?.success !== true) {
+    throw Object.assign(new Error("Tranzak n’a pas confirmé la demande."), {
+      refused: [401, 403, 422].includes(r.status) || (r.status === 400 &&
+        ["validation_error", "payment_method_not_available", "amount_too_low",
+         "amount_too_high", "payment_processing_failed"].includes(r.data?.error))
+    });
+  }
+
+  twAssert(cfg.mode === "test" || !(r.data.test_mode === true || r.data.simulated === true),
+    409, "Réponse sandbox reçue en mode live.");
+  return r.data;
+}
+
+function twAmountMatches(value, amount) {
+  const m = /^(\d{1,9})(?:\.(\d{1,2}))?$/.exec(String(value));
+  return !!m && Number(m[1]) * 100 + Number((m[2] || "").padEnd(2, "0")) === amount * 100;
+}
+
+function twMatch(op, p) {
+  twAssert(
+    p && twIdOK(p.transaction_id) && p.reference === op.id &&
+    (!op.providerId || op.providerId === p.transaction_id) &&
+    p.payment_method === op.network && p.currency === "HTG" &&
+    twAmountMatches(p.amount, op.amount) &&
+    (op.mode === "test" || !(p.test_mode === true || p.simulated === true)),
+    409, "Le paiement ne correspond pas à la recharge."
+  );
+}
+
+async function twApply(id, cfg, payment, patch = {}) {
+  const ref = twOp(id);
+  return db.runTransaction(async t => {
+    const op = (await t.get(ref)).data();
+    if (!op || op.mode !== cfg.mode) return null;
+    if (payment) twMatch(op, payment);
+    if (op.status !== "pending") return twPublic(op);
+
+    const providerId = payment?.transaction_id || patch.providerId;
+    twAssert(!op.providerId || !providerId || providerId === op.providerId, 409, "Paiement différent.");
+    const url = cfg.mode === "test" && op.network === "moncash" ? null
+      : twCheckout(payment?.payment_url || patch.redirectUrl);
+    const fields = providerId ? { providerId, ...(url ? { redirectUrl: url } : {}) } : {};
+    let status = payment?.status;
+
+    if (!payment && ((patch.refused && !op.providerId) ||
+      (patch.testExpired && cfg.mode === "test" && op.providerId === patch.expectedId))) status = "failed";
+
+    if (status !== "completed" && status !== "failed") {
+      if (providerId) t.update(ref, fields);
+      return twPublic({ ...op, ...fields });
+    }
+
+    const sr = twState(op.uid, op.mode), ur = twUser(op.uid);
+    const [s, u] = await Promise.all([t.get(sr), t.get(ur)]);
+    twAssert(u.exists && s.data()?.pending === id, 409, "Recharge à rapprocher.");
+    twAssert(twSavedRail(s.data()) === op.network, 409, "Réseau à rapprocher.");
+    const statePatch = { pending: null, last: { id, status, network: op.network, amount: op.amount } };
+    const historyPatch = { status, providerTransactionId: providerId || null, finishedAt: twStamp() };
+
+    if (status === "completed") {
+      const total = Number((op.mode === "test" ? s.data().testBalance : u.data().wallet) ?? 0);
+      const cents = Math.round(total * 100);
+      twAssert(total >= 0 && Math.abs(total - cents / 100) < 0.000001 &&
+        Number.isSafeInteger(cents + op.amount * 100), 409, "Solde à rapprocher.");
+      const balance = (cents + op.amount * 100) / 100;
+      if (op.mode === "test") statePatch.testBalance = balance;
+      else t.update(ur, { wallet: balance });
+      Object.assign(historyPatch, { balanceAfter: balance, completedAt: twStamp() });
+    }
+
+    t.update(sr, statePatch);
+    t.update(ref, {
+      ...fields, status, finishedAt: twStamp(),
+      [twNext(op.mode)]: admin.firestore.FieldValue.delete()
+    });
+    if (op.mode === "live") t.update(twHistory(id), historyPatch);
+    return twPublic({ ...op, status });
+  });
+}
+
+async function twCheck(id, cfg, { uid, webhookId, simulate, sweep } = {}) {
+  const op = (await twOp(id).get()).data();
+  if (!op || op.mode !== cfg.mode) return null;
+  twAssert(!uid || uid === op.uid, 404, "Recharge introuvable.");
+  twAssert(!webhookId || !op.providerId || webhookId === op.providerId, 409, "Paiement différent.");
+  if (op.status !== "pending") return twPublic(op);
+
+  const pid = op.providerId || webhookId;
+  let p = (await twApi(cfg, "GET", pid ? "/payments/" + pid : "/payments/reference/" + id))?.data;
+  if (!p) {
+    if (cfg.mode === "test" && (uid || sweep) &&
+      Date.now() - (op.createdAt?.toMillis?.() || Date.now()) > 30 * 60000) {
+      return twApply(id, cfg, null, { testExpired: true, expectedId: op.providerId });
+    }
+    return twPublic(op);
+  }
+
+  twAssert(!pid || p.transaction_id === pid, 409, "Paiement différent.");
+  twMatch(op, p);
+  if (simulate && ["pending", "processing"].includes(p.status)) {
+    twAssert(uid && cfg.mode === "test" && op.network === "moncash", 403, "Simulation indisponible.");
+    await twApi(cfg, "POST", "/payments/" + p.transaction_id + "/verify");
+    p = (await twApi(cfg, "GET", "/payments/" + p.transaction_id))?.data;
+    if (!p) return twPublic(op);
+  }
+  return twApply(id, cfg, p);
+}
+
+function receiveTranzakWebhook(req, res) {
+  return twRoute(async (req, res) => {
+    const cfg = twConfig(), sig = req.get("X-Tranzak-Signature") || "";
+    twAssert(cfg && Buffer.isBuffer(req.body) && /^[a-f0-9]{64}$/i.test(sig), 403, "Signature invalide.");
+    const expected = crypto.createHmac("sha256", cfg.secret).update(req.body).digest();
+    twAssert(crypto.timingSafeEqual(expected, Buffer.from(sig, "hex")), 403, "Signature invalide.");
+
+    let event;
+    try { event = JSON.parse(req.body.toString("utf8")); } catch { return res.sendStatus(400); }
+    if (!["payment.success", "payment.failed"].includes(event?.event)) return res.sendStatus(204);
+    const id = event.data?.reference, pid = event.data?.transaction_id;
+    if (!twRefOK(id) || !twIdOK(pid)) return res.sendStatus(204);
+
+    const result = await twCheck(id, cfg, { webhookId: pid });
+    return res.sendStatus(result?.status === "pending" ? 503 : 204);
+  })(req, res);
+}
+
+app.get(["/api/tranzak/return", "/api/moncash/payment-return"], (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.redirect(303, "https://www.hayticlips.com/wallet.html?tranzak=retour");
 });
 
+app.get("/api/tranzak/wallet", verifyFirebaseToken, twRoute(async (req, res) => {
+  const uid = req.user.uid, cfg = twConfig(), enabled = twAllowed(cfg, uid);
+  const mode = enabled ? cfg.mode : null;
+  const u = await twUser(uid).get();
+  twAssert(u.exists, 404, "Profil introuvable.");
+  const data = u.data(), real = (await twState(uid, "live").get()).data() || {};
+  const s = mode === "test" ? (await twState(uid, "test").get()).data() || {} : real;
+  const pending = enabled && s.pending ? (await twOp(s.pending).get()).data() : null;
+  const manualRail = twSavedRail(real);
+  const manualEnabled = !data.suspended && !data.frozenWallet &&
+    (manualRail !== "natcash" || !!twNatNumber());
 
+  res.json({
+    enabled, mode, network: twSavedRail(s),
+    rechargeAllowed: enabled && !data.suspended && !data.frozenWallet && !data.depositBlocked,
+    manualNetwork: manualRail, manualNatCash: twNatNumber(),
+    manualDepositAllowed: manualEnabled && !data.depositBlocked,
+    manualWithdrawAllowed: manualEnabled && !data.withdrawBlocked,
+    manualWithdrawRemaining: Math.max(0, 2 - twManualCount(data)),
+    natcashAllowed: mode === "test" || !!twNatNumber(),
+    testBalance: mode === "test" ? s.testBalance || 0 : null,
+    pending: twPublic(pending), last: enabled ? s.last || null : null
+  });
+}));
 
-app.get("/api/moncash/payment-return", async (req,res)=>{
-  try{
-    const orderId = String(req.query.orderId || "").trim();
+app.post("/api/tranzak/network", verifyFirebaseToken, twRoute(async (req, res) => {
+  const uid = req.user.uid, cfg = twAccess(req), network = req.body?.network;
+  twAssert(twRail(network), 400, "Réseau invalide.");
 
-    if(!orderId){
-      return res.status(400).send("orderId manquant");
+  await db.runTransaction(async t => {
+    const ur = twUser(uid), sr = twState(uid, cfg.mode);
+    const [u, state] = await Promise.all([t.get(ur), t.get(sr)]);
+    twAssert(u.exists, 404, "Profil introuvable.");
+    twUserOpen(u.data());
+
+    const s = state.data() || {};
+    if (network === twSavedRail(s)) return;
+    twAssert(!s.pending, 409, "Termine la recharge en cours.");
+
+    if (cfg.mode === "test") {
+      t.set(sr, { network, testBalance: 0, last: null }, { merge: true });
+      return;
     }
 
-    const txSnap = await db.collection("walletTransactions")
-      .where("orderId","==",orderId)
-      .where("type","==","deposit")
-      .limit(1)
-      .get();
+    twAssert(network !== "natcash" || twNatNumber(), 503, "Le manuel NatCash n’est pas activé.");
+    const [wallet, manual] = await Promise.all([
+      t.get(twPending(uid, "walletTransactions")), t.get(twPending(uid, "manualTransfers"))
+    ]);
+    twAssert(Number(u.data().wallet ?? 0) === 0 && Number(u.data().walletLocked ?? 0) === 0 &&
+      wallet.empty && manual.empty, 409, "Il faut un solde nul et aucune opération en attente.");
+    t.set(sr, { network }, { merge: true });
+  });
 
-    if(txSnap.empty){
-      return res.status(404).send("Transaction introuvable");
+  res.json({ success: true, network });
+}));
+
+app.post("/api/requestRecharge", verifyFirebaseToken, twRoute(async (req, res) => {
+  const uid = req.user.uid, cfg = twAccess(req);
+  const { amount, network, requestKey } = req.body;
+  twAssert(Date.now() >= twBackoffUntil, 429, "Réessaie dans un instant.");
+  twAssert(TW_AMOUNTS.includes(amount) && twRail(network) &&
+    typeof requestKey === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(requestKey),
+    400, "Recharge invalide.");
+
+  const id = (cfg.mode === "test" ? "HCT_" : "HCL_") +
+    crypto.createHash("sha256").update(uid + ":" + requestKey).digest("hex").slice(0, 32);
+  const ref = twOp(id), sr = twState(uid, cfg.mode);
+
+  const initial = await db.runTransaction(async t => {
+    const [u, state, old] = await Promise.all([t.get(twUser(uid)), t.get(sr), t.get(ref)]);
+    twAssert(u.exists, 404, "Profil introuvable.");
+
+    if (old.exists) {
+      const op = old.data();
+      twAssert(op.uid === uid && op.network === network && op.amount === amount, 409, "Référence déjà utilisée.");
+      return { op, fresh: false };
     }
 
-    const txDoc = txSnap.docs[0];
-    const tx = txDoc.data();
+    twUserOpen(u.data());
+    const s = state.data() || {};
+    twAssert(network === twSavedRail(s), 409, "Utilise le réseau enregistré.");
+    if (cfg.mode === "live") twAssert(network !== "natcash" || twNatNumber(), 503, "Le manuel NatCash n’est pas activé.");
+    twAssert(!s.pending, 409, "Une recharge est déjà en attente.");
 
-    if(tx.status !== "pending"){
-      return res.redirect("/wallet.html");
+    if (cfg.mode === "live") {
+      const existing = await t.get(twPending(uid, "walletTransactions", true));
+      twAssert(existing.empty, 409, "Une autre recharge est encore en attente.");
     }
 
-    const details = await moncashRetrieveOrderPayment(orderId);
-    const payment = details?.payment;
-
-    if(!payment || payment.message !== "successful"){
-      await txDoc.ref.update({
-        status: "failed",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-        failReason: "Paiement non confirmé"
-      });
-
-      return res.redirect("/wallet.html");
-    }
-
-    await db.runTransaction(async (t)=>{
-      const freshTx = await t.get(txDoc.ref);
-
-      if(!freshTx.exists){
-        throw new Error("Transaction manquante");
-      }
-
-      const freshTxData = freshTx.data();
-
-      if(freshTxData.status !== "pending"){
-        return;
-      }
-
-      const userRef = db.collection("users").doc(freshTxData.userId);
-      const userSnap = await t.get(userRef);
-
-      if(!userSnap.exists){
-        throw new Error("Utilisateur introuvable");
-      }
-
-      const user = userSnap.data() || {};
-      const wallet = Number(user.wallet || 0);
-      const amount = Number(freshTxData.amount || 0);
-      const newWallet = wallet + amount;
-
-      t.update(userRef,{
-        wallet: newWallet
-      });
-
-      t.update(txDoc.ref,{
-        status: "completed",
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        transactionId: payment.transaction_id || null,
-        moncashReference: payment.reference || null,
-        payer: payment.payer || null,
-        balanceAfter: newWallet
-      });
+    const op = {
+      id, uid, amount, network, mode: cfg.mode, status: "pending", createdAt: twStamp(),
+      [twNext(cfg.mode)]: Date.now() + 60000
+    };
+    t.create(ref, op);
+    t.set(sr, { network, pending: id }, { merge: true });
+    if (cfg.mode === "live") t.create(twHistory(id), {
+      userId: uid, type: "deposit", method: network, provider: "tranzak",
+      amount, status: "pending", createdAt: twStamp()
     });
+    return { op, fresh: true };
+  });
 
-    return res.redirect("/wallet.html");
+  if (!initial.fresh) return res.json({ success: true, ...twPublic(initial.op) });
 
-  }catch(e){
-    console.log("MONCASH RETURN ERROR:", e.response?.data || e.message || e);
-    return res.status(500).send("Erreur callback recharge");
+  let result;
+  try {
+    result = await twApi(cfg, "POST", "/payments", {
+      amount, currency: "HTG", payment_method: network, reference: id,
+      customer_name: cfg.mode === "test" ? "HaytiClips test" : "Client HaytiClips"
+    });
+  } catch (e) {
+    const op = e.refused ? await twApply(id, cfg, null, { refused: true }) : twPublic(initial.op);
+    return res.json({ success: true, ...op });
   }
-});
 
+  const op = twIdOK(result?.transaction_id) && result.currency === "HTG" && twAmountMatches(result.amount, amount)
+    ? await twApply(id, cfg, null, { providerId: result.transaction_id, redirectUrl: result.payment_url })
+    : twPublic(initial.op);
+  res.json({ success: true, ...op });
+}));
+
+app.post("/api/tranzak/check", verifyFirebaseToken, twRoute(async (req, res) => {
+  const uid = req.user.uid, cfg = twAccess(req);
+  const s = (await twState(uid, cfg.mode).get()).data() || {};
+  const result = s.pending
+    ? await twCheck(s.pending, cfg, { uid, simulate: req.body?.simulate === true })
+    : s.last;
+  res.json({ success: true, result: result || null });
+}));
+
+let twSweeping = false;
+async function twSweep() {
+  const cfg = twConfig();
+  if (!cfg || twSweeping || Date.now() < twBackoffUntil) return;
+  twSweeping = true;
+
+  try {
+    const key = twNext(cfg.mode);
+    const due = await db.collection("tranzakRecharges")
+      .where(key, "<=", Date.now()).orderBy(key).limit(8).get();
+
+    for (const row of due.docs) {
+      if (Date.now() < twBackoffUntil) break;
+      const picked = await db.runTransaction(async t => {
+        const op = (await t.get(row.ref)).data();
+        if (op?.mode !== cfg.mode || op.status !== "pending" || !(op[key] <= Date.now())) return false;
+        const checks = (op.checks || 0) + 1;
+        t.update(row.ref, { checks, [key]: Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(checks, 6)) });
+        return true;
+      });
+      if (picked) {
+        try { await twCheck(row.id, cfg, { sweep: true }); }
+        catch (e) { console.warn("TRANZAK_RECHECK", row.id, e.twStatus || e.code || "unknown"); }
+      }
+    }
+  } catch (e) {
+    console.error("TRANZAK_SWEEP", e.code || e.name);
+  } finally {
+    twSweeping = false;
+  }
+}
+setInterval(twSweep, 60000).unref();
 
 
 
@@ -6527,147 +6841,15 @@ const run = async fn => {
     };
   }
 
-  app.post("/api/requestWithdraw", auth, wrap(async (req, res) => {
-    const uid = req.user.uid;
-    const amount = C.minor(req.body.amount, "Montant", false);
 
-    C.fail(
-      Number.isInteger(req.body.amount) &&
-      [250, 500, 1000, 2000, 5000, 10000, 20000, 80000]
-        .includes(req.body.amount),
-      "Montant non autorisé"
-    );
 
-    const txRef = db.collection("walletTransactions").doc();
-    const reference = `WDR_${crypto.randomUUID()}`;
+app.post("/api/requestWithdraw", auth, (req, res) => {
+  res.status(410).json({
+    success: false,
+    error: "Les retraits se font depuis la page Transfert Manuel."
+  });
+});
 
-    const result = await run(async t => {
-      const data = await user(t, uid);
-      enabled(data, "withdraw");
-
-      if (!await pin(t, uid, data, req.body.pin)) {
-        return { pinError: true };
-      }
-
-      C.fail(
-        /^509\d{8}$/.test(data.withdrawNumber || ""),
-        "Numéro de retrait non enregistré"
-      );
-
-      if (data.pendingAutomaticWithdrawId) {
-        const previous = await t.get(
-          ref("walletTransactions", data.pendingAutomaticWithdrawId)
-        );
-
-        if (previous.exists && previous.data().status === "pending") {
-          C.fail(
-            previous.data().amount === req.body.amount,
-            "Un autre retrait est déjà en cours",
-            409
-          );
-
-          return { txId: previous.id, created: false };
-        }
-      }
-
-      const oldPending = await t.get(
-        db.collection("walletTransactions")
-          .where("userId", "==", uid)
-          .where("type", "==", "withdraw")
-          .where("status", "==", "pending")
-          .limit(1)
-      );
-
-      C.fail(
-        oldPending.empty,
-        "Un retrait existant doit être rapproché avant une nouvelle demande",
-        409
-      );
-
-      const money = C.money(data);
-
-      C.fail(
-        money.available >= amount,
-        "Solde disponible insuffisant",
-        409
-      );
-
-      const daily = dailyLimit(data, uid, amount);
-
-      t.update(ref("users", uid), {
-        walletLocked: C.htg(money.locked + amount),
-        pendingAutomaticWithdrawId: txRef.id,
-        ...daily
-      });
-
-      t.create(txRef, {
-        userId: uid,
-        amount: C.htg(amount),
-        number: data.withdrawNumber,
-        method: "moncash",
-        type: "withdraw",
-        status: "pending",
-        reservationSource: "server-v2",
-        providerState: "reserved",
-        providerReference: reference,
-        reservedDay: daily.withdrawResetAt,
-        accountingVersion: 2,
-        scope: "wallet",
-        walletDelta: 0,
-        lockedDelta: 0,
-        createdAt: stamp()
-      });
-
-      journal(
-        t, `hold_${txRef.id}`, uid, "withdraw_reserved",
-        amount, money.wallet, money.locked + amount,
-        {
-          walletDelta: 0,
-          lockedDelta: C.htg(amount),
-          withdrawTxId: txRef.id
-        }
-      );
-
-      return {
-        txId: txRef.id,
-        created: true,
-        number: data.withdrawNumber
-      };
-    });
-
-    if (result.pinError) {
-      return res.status(400).json({
-        success: false,
-        error: "PIN incorrect"
-      });
-    }
-
-    if (!result.created) {
-      return res.json(await reconcile(result.txId));
-    }
-
-    let payout;
-
-    try {
-      payout = await moncashTransfer(
-        C.htg(amount),
-        result.number,
-        `Retrait HaytiClips ${uid}`,
-        reference
-      );
-    } catch {
-      // Ne jamais répéter un transfert dont la réponse est incertaine.
-    }
-
-    if (payout?.transfer?.message === "successful") {
-      return res.json(
-        await finalizeAutomatic(result.txId, payout)
-      );
-    }
-
-    const state = await reconcile(result.txId);
-    res.status(state.pending ? 202 : 200).json(state);
-  }));
 
   app.get("/api/withdraw/status/:txId", auth, wrap(async (req, res) => {
     const txId = C.id(req.params.txId);
@@ -6859,6 +7041,14 @@ const run = async fn => {
       const data = await user(t, req.user.uid);
       C.fail(data.suspended !== true, "Compte suspendu", 403);
 
+
+const existing = await t.get(ref("userPrivate", req.user.uid));
+C.fail(!existing.data()?.pinHash && !data.security?.pinHash,
+  "Un PIN existe déjà. Supprime-le avec ton PIN actuel avant d’en créer un autre.", 409);
+
+const age = Date.now() / 1000 - Number(req.user.auth_time);
+C.fail(age >= 0 && age <= 300, "Reconnecte-toi avant de créer ton PIN.", 403);
+
       t.set(ref("userPrivate", req.user.uid), {
         pinHash: hash,
         pinFailedAttempts: 0,
@@ -6929,248 +7119,110 @@ const run = async fn => {
     res.json({ success: true });
   }));
 
-  app.post("/api/manual-transfer", auth, (req, res) => {
-    uploadMemory.single("receipt")(req, res, err => {
-      if (err) {
-        return res.status(400).json({
-          success: false,
-          error: "Capture invalide ou trop volumineuse"
+
+
+
+const manualUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 10, fieldSize: 4096 }
+}).single("receipt");
+const manualLimiter = rateLimit({ windowMs: 60000, max: 12 });
+
+app.post("/api/manual-transfer", auth, manualLimiter, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  manualUpload(req, res, err => {
+    if (err) return res.status(400).json({ success: false, error: "Reçu invalide ou supérieur à 5 Mo." });
+
+    void wrap(async (req, res) => {
+      const uid = req.user.uid, body = req.body || {};
+      const type = body.type, method = body.method, phone = twHaitiNumber(body.phone);
+      C.fail(["deposit", "withdraw"].includes(type) && twRail(method), "Réseau ou type invalide.");
+      C.fail(phone, "Numéro haïtien invalide.");
+
+      const raw = type === "withdraw" ? body.amountRequested : body.amount;
+      const amountHtg = typeof raw === "string" && /^\d{1,9}$/.test(raw) ? Number(raw) : raw;
+      const min = type === "withdraw" ? 150 : 100;
+      C.fail(Number.isSafeInteger(amountHtg) && amountHtg >= min, "Montant entier minimum : " + min + " HTG.");
+      const amount = C.minor(amountHtg, "Montant", false);
+      const transferRef = db.collection("manualTransfers").doc();
+
+      if (type === "withdraw") {
+        const fee = twManualFee(amountHtg);
+        const accountName = C.text(body.accountName, "Bénéficiaire", 150, 2);
+        const result = await run(async t => {
+          const data = await user(t, uid);
+          enabled(data, "withdraw");
+          await twManualGuard(t, uid, method);
+          if (!await pin(t, uid, data, body.pin)) return { pinError: true };
+
+          const pending = await t.get(db.collection("manualTransfers")
+            .where("userId", "==", uid).where("type", "==", "withdraw").where("status", "==", "pending").limit(1));
+          C.fail(pending.empty, "Un retrait manuel est déjà en attente.", 409);
+
+          const money = C.money(data);
+          C.fail(money.available >= amount, "Solde disponible insuffisant.", 409);
+          const count = twManualCount(data);
+          C.fail(count < 2, "Limite de deux demandes par jour atteinte.", 409);
+          const daily = dailyLimit(data, uid, amount);
+
+          t.update(ref("users", uid), {
+            walletLocked: C.htg(money.locked + amount),
+            pendingManualWithdrawId: transferRef.id,
+            manualWithdrawDay: twToday(), manualWithdrawCount: count + 1, ...daily
+          });
+          t.create(transferRef, {
+            source: "server-v2", userId: uid, type, method, phone, accountName,
+            amountRequested: amountHtg, feeApplied: fee, amountToReceive: amountHtg - fee,
+            feeIsEstimate: false, status: "pending", reservedDay: daily.withdrawResetAt, createdAt: stamp()
+          });
+          journal(t, "manual_hold_" + transferRef.id, uid, "manual_withdraw_pending",
+            amount, money.wallet, money.locked + amount,
+            { transferId: transferRef.id, walletDelta: 0, lockedDelta: amountHtg });
+          return { success: true, transferId: transferRef.id };
         });
+        if (result.pinError) return res.status(400).json({ success: false, error: "PIN incorrect." });
+        return res.json(result);
       }
 
-      wrap(async (req, res) => {
-        const uid = req.user.uid;
-        const body = req.body;
+      const contentType = twReceiptMime(req.file?.buffer);
+      C.fail(contentType && req.file.mimetype === contentType, "Reçu PNG, JPG ou WebP obligatoire.");
+      const top = await ref("users", uid).get();
+      C.fail(top.exists, "Utilisateur introuvable.", 404);
+      enabled(top.data(), "deposit");
+      await twManualGuard(null, uid, method);
 
-        C.fail(
-          ["deposit", "withdraw"].includes(body.type),
-          "Type invalide"
-        );
+      const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
+      const filename = "receipts/" + uid + "/" + crypto.randomUUID();
+      const bucket = twReceipts();
+      const upload = await bucket.upload(filename, req.file.buffer, { contentType, upsert: false, cacheControl: "0" });
+      C.fail(!upload.error, "Envoi du reçu impossible.", 503);
 
-        const method = C.text(
-          body.method, "Méthode de transfert", 60, 1
-        );
+      try {
+        await run(async t => {
+          enabled(await user(t, uid), "deposit");
+          await twManualGuard(t, uid, method);
 
-        const phone = C.text(body.phone, "Téléphone", 30, 8);
+          const claim = ref("manualReceiptClaims", hash);
+          C.fail(!(await t.get(claim)).exists, "Ce reçu a déjà été soumis.", 409);
 
-        const amount = C.minor(
-          Number(
-            body.type === "withdraw"
-              ? body.amountRequested
-              : body.amount
-          ),
-          "Montant",
-          false
-        );
-
-        if (body.type === "withdraw") {
-          const fee = C.minor(
-            Number(body.feeApplied), "Frais estimés"
-          );
-
-          const receive = C.minor(
-            Number(body.amountToReceive),
-            "Montant à recevoir",
-            false
-          );
-
-          C.fail(
-            fee + receive === amount,
-            "Montant et frais incohérents"
-          );
-
-          const transferRef =
-            db.collection("manualTransfers").doc();
-
-          const result = await run(async t => {
-            const data = await user(t, uid);
-            enabled(data, "withdraw");
-
-            if (!await pin(t, uid, data, body.pin)) {
-              return { pinError: true };
-            }
-
-            if (data.pendingManualWithdrawId) {
-              const previous = await t.get(
-                ref("manualTransfers", data.pendingManualWithdrawId)
-              );
-
-              if (
-                previous.exists &&
-                previous.data().status === "pending"
-              ) {
-                return {
-                  success: true,
-                  transferId: previous.id,
-                  alreadyPending: true
-                };
-              }
-            }
-
-            const pending = await t.get(
-              db.collection("manualTransfers")
-                .where("userId", "==", uid)
-                .where("type", "==", "withdraw")
-                .where("status", "==", "pending")
-                .limit(1)
-            );
-
-            C.fail(
-              pending.empty,
-              "Un retrait manuel est déjà en attente",
-              409
-            );
-
-            const money = C.money(data);
-
-            C.fail(
-              money.available >= amount,
-              "Solde disponible insuffisant",
-              409
-            );
-
-            const daily = dailyLimit(data, uid, amount);
-
-            t.update(ref("users", uid), {
-              walletLocked: C.htg(money.locked + amount),
-              pendingManualWithdrawId: transferRef.id,
-              ...daily
-            });
-
-            t.create(transferRef, {
-              source: "server-v2",
-              userId: uid,
-              type: "withdraw",
-              method,
-              amountRequested: C.htg(amount),
-              feeApplied: C.htg(fee),
-              amountToReceive: C.htg(receive),
-              feeIsEstimate: true,
-              phone,
-              accountName: C.text(
-                body.accountName || "",
-                "Nom du bénéficiaire",
-                150
-              ),
-              status: "pending",
-              reservedDay: daily.withdrawResetAt,
-              createdAt: stamp()
-            });
-
-            journal(
-              t, `manual_hold_${transferRef.id}`, uid,
-              "manual_withdraw_pending", amount,
-              money.wallet, money.locked + amount,
-              {
-                transferId: transferRef.id,
-                walletDelta: 0,
-                lockedDelta: C.htg(amount)
-              }
-            );
-
-            return {
-              success: true,
-              transferId: transferRef.id
-            };
+          t.set(twState(uid, "live"), { network: method }, { merge: true });
+          t.create(claim, { transferId: transferRef.id, uid, createdAt: stamp() });
+          t.create(transferRef, {
+            source: "server-v2", userId: uid, type, method, amount: amountHtg, phone,
+            receiptFileName: filename, receiptStorage: "private-v1",
+            status: "pending", createdAt: stamp()
           });
-
-          if (result.pinError) {
-            return res.status(400).json({
-              success: false,
-              error: "PIN incorrect"
-            });
-          }
-
-          return res.json(result);
-        }
-
-        C.fail(
-          req.file?.buffer?.length > 0,
-          "Capture d’écran obligatoire"
-        );
-
-        C.fail(
-          ["image/jpeg", "image/png", "image/webp"]
-            .includes(req.file.mimetype),
-          "Capture JPG, PNG ou WebP requise"
-        );
-
-        const fileHash = crypto.createHash("sha256")
-          .update(req.file.buffer)
-          .digest("hex");
-
-        const transferRef =
-          db.collection("manualTransfers").doc();
-
-        const fileName =
-          `receipts/${uid}/${crypto.randomUUID()}`;
-
-        const top = await ref("users", uid).get();
-        C.fail(top.exists, "Utilisateur introuvable", 404);
-        enabled(top.data(), "deposit");
-
-        const uploaded = await supabase.storage
-          .from("media")
-          .upload(fileName, req.file.buffer, {
-            contentType: req.file.mimetype,
-            upsert: false
-          });
-
-        C.fail(
-          !uploaded.error,
-          "Envoi de capture impossible",
-          503
-        );
-
-        try {
-          await run(async t => {
-            const data = await user(t, uid);
-            enabled(data, "deposit");
-
-            const claimRef =
-              ref("manualReceiptClaims", fileHash);
-
-            const claim = await t.get(claimRef);
-
-            C.fail(
-              !claim.exists,
-              "Cette capture a déjà été soumise",
-              409
-            );
-
-            t.create(claimRef, {
-              transferId: transferRef.id,
-              uid,
-              createdAt: stamp()
-            });
-
-            t.create(transferRef, {
-              source: "server-v2",
-              userId: uid,
-              type: "deposit",
-              method,
-              amount: C.htg(amount),
-              phone,
-              receiptFileName: fileName,
-              receiptUrl: supabase.storage
-                .from("media")
-                .getPublicUrl(fileName).data.publicUrl,
-              status: "pending",
-              createdAt: stamp()
-            });
-          });
-        } catch (e) {
-          await supabase.storage.from("media").remove([fileName]);
-          throw e;
-        }
-
-        res.json({
-          success: true,
-          transferId: transferRef.id
         });
-      })(req, res);
-    });
+      } catch (e) {
+        try { if (!(await transferRef.get()).exists) await bucket.remove([filename]); } catch {}
+        throw e;
+      }
+
+      return res.json({ success: true, transferId: transferRef.id });
+    })(req, res);
   });
+});
+
 
   app.post(
     "/api/admin/review-legacy-manual-transfer",
@@ -7215,167 +7267,99 @@ const run = async fn => {
     })
   );
 
-  app.post(
-    "/api/admin/process-manual-transfer",
-    auth,
-    wrap(async (req, res) => {
-      const transferId = C.id(req.body.transferId);
-      const status = req.body.status;
 
-      C.fail(
-        ["approved", "rejected"].includes(status),
-        "Statut invalide"
-      );
 
-      const reason = status === "rejected"
-        ? C.text(req.body.reason, "Motif de refus", 1000, 5)
-        : "";
+app.post("/api/admin/process-manual-transfer", auth, wrap(async (req, res) => {
+  const { transferId: rawId, status, method, operatorRef: rawRef } = req.body || {};
+  const transferId = C.id(rawId);
+  C.fail(["approved", "rejected"].includes(status), "Statut invalide.");
+  const approved = status === "approved";
+  const reason = approved ? "" : C.text(req.body.reason, "Motif", 1000, 5);
+  const operatorRef = approved ? twOperatorRef(rawRef) : null;
+  C.fail(!approved || operatorRef, "Indique la référence du mouvement chez l’opérateur.");
 
-      let receipt = null;
+  const receipt = await run(async t => {
+    C.staff(await user(t, req.user.uid), true);
+    const snap = await t.get(ref("manualTransfers", transferId));
+    C.fail(snap.exists && snap.data().status === "pending", "Demande déjà traitée ou introuvable.", 409);
 
-      await run(async t => {
-        C.staff(await user(t, req.user.uid), true);
+    const x = snap.data();
+    C.fail(x.source === "server-v2" || x.legacyReviewedBy, "Ancienne demande à rapprocher.", 409);
+    C.fail(["deposit", "withdraw"].includes(x.type), "Type invalide.");
+    const withdrawal = x.type === "withdraw";
+    const rail = String(x.method ?? "moncash").trim().toLowerCase();
+    const amount = C.minor(Number(withdrawal ? (x.amountRequested ?? x.amount) : x.amount), "Montant", false);
+    const data = await user(t, x.userId);
+    const money = C.money(data);
+    let proof = null;
 
-        const snap = await t.get(
-          ref("manualTransfers", transferId)
-        );
+    if (approved) {
+      C.fail(method === rail && twRail(rail), "Le réseau ne correspond pas à la demande.", 409);
+      await twManualGuard(t, x.userId, rail, true);
 
-        C.fail(snap.exists, "Transfert introuvable", 404);
-        const transfer = snap.data();
-
-        C.fail(
-          transfer.status === "pending",
-          "Transfert déjà traité",
-          409
-        );
-
-        C.fail(
-          transfer.source === "server-v2" ||
-          transfer.legacyReviewedBy,
-          "Cette ancienne demande doit être vérifiée avant traitement",
-          409,
-          "LEGACY_REVIEW_REQUIRED"
-        );
-
-        C.fail(
-          ["deposit", "withdraw"].includes(transfer.type),
-          "Type invalide"
-        );
-
-        const amount = C.minor(
-          Number(
-            transfer.type === "withdraw"
-              ? transfer.amountRequested
-              : transfer.amount
-          ),
-          "Montant",
-          false
-        );
-
-        const data = await user(t, transfer.userId);
-        const money = C.money(data);
-
-        let wallet = money.wallet;
-        let locked = money.locked;
-        let walletDelta = 0;
-        let lockedDelta = 0;
-
-        if (transfer.type === "withdraw") {
-          C.fail(
-            locked >= amount,
-            "Réservation insuffisante",
-            409
-          );
-
-          locked -= amount;
-          lockedDelta = -amount;
-
-          if (status === "approved") {
-            C.fail(wallet >= amount, "Solde insuffisant", 409);
-            wallet -= amount;
-            walletDelta = -amount;
-          }
-
-          const fields = {
-            wallet: C.htg(wallet),
-            walletLocked: C.htg(locked),
-            pendingManualWithdrawId: null
-          };
-
-          if (
-            status === "rejected" &&
-            transfer.source === "server-v2" &&
-            data.withdrawResetAt === transfer.reservedDay
-          ) {
-            fields.withdrawDailyTotal = C.htg(Math.max(
-              0,
-              C.minor(Number(data.withdrawDailyTotal || 0)) - amount
-            ));
-          }
-
-          t.update(ref("users", transfer.userId), fields);
-        } else if (status === "approved") {
-          wallet += amount;
-          walletDelta = amount;
-
-          t.update(ref("users", transfer.userId), {
-            wallet: C.htg(wallet)
-          });
-        }
-
-        journal(
-          t, `manual_done_${transferId}`, transfer.userId,
-          `manual_${transfer.type}_${status}`,
-          amount, wallet, locked,
-          {
-            transferId,
-            walletDelta: C.htg(walletDelta),
-            lockedDelta: C.htg(lockedDelta)
-          }
-        );
-
-        t.update(snap.ref, {
-          status,
-          processedAt: stamp(),
-          processedBy: req.user.uid,
-          rejectReason: reason
-        });
-
-        if (status === "rejected") {
-          t.create(db.collection("notifications").doc(), {
-            to: transfer.userId,
-            from: req.user.uid,
-            type: "transfer_rejected",
-            message: `Demande refusée : ${reason}`,
-            read: false,
-            createdAt: stamp()
-          });
-        }
-
-        const name = transfer.receiptFileName;
-
-        receipt =
-          transfer.type === "deposit" &&
-          typeof name === "string" &&
-          (
-            name.startsWith(`receipts/${transfer.userId}/`) ||
-            name.startsWith(`${transfer.userId}_`)
-          )
-            ? name
-            : null;
-      });
-
-      if (receipt) {
-        try {
-          await supabase.storage.from("media").remove([receipt]);
-        } catch {
-          // Le nettoyage ne modifie pas le résultat comptable.
-        }
+      if (withdrawal) {
+        const net = C.minor(Number(x.amountToReceive), "Montant à envoyer", false);
+        const fee = C.minor(Number(x.feeApplied), "Frais");
+        C.fail(twHaitiNumber(x.phone) && String(x.accountName || "").trim() &&
+          net + fee === amount, "Bénéficiaire, numéro ou montant incohérent.", 409);
       }
 
-      res.json({ success: true });
-    })
-  );
+      const key = crypto.createHash("sha256").update(rail + ":" + operatorRef).digest("hex");
+      proof = ref("manualOperatorClaims", key);
+      C.fail(!(await t.get(proof)).exists, "Cette référence a déjà été validée.", 409);
+    }
+
+    let wallet = money.wallet, locked = money.locked;
+
+    if (withdrawal) {
+      C.fail(locked >= amount, "Réservation insuffisante.", 409);
+      locked -= amount;
+      if (approved) wallet -= amount;
+
+      const fields = { wallet: C.htg(wallet), walletLocked: C.htg(locked) };
+      if (data.pendingManualWithdrawId === transferId) fields.pendingManualWithdrawId = null;
+      if (!approved && x.source === "server-v2" && data.withdrawResetAt === x.reservedDay) {
+        fields.withdrawDailyTotal = C.htg(Math.max(0, C.minor(Number(data.withdrawDailyTotal || 0)) - amount));
+      }
+      t.update(ref("users", x.userId), fields);
+    } else if (approved) {
+      wallet += amount;
+      t.update(ref("users", x.userId), { wallet: C.htg(wallet) });
+    }
+
+    if (proof) t.create(proof, { transferId, method: rail, approvedBy: req.user.uid, createdAt: stamp() });
+    journal(t, "manual_done_" + transferId, x.userId,
+      "manual_" + x.type + "_" + status, amount, wallet, locked, {
+        transferId, walletDelta: C.htg(wallet - money.wallet), lockedDelta: C.htg(locked - money.locked)
+      });
+    t.update(snap.ref, {
+      status, processedBy: req.user.uid, processedAt: stamp(), rejectReason: reason,
+      ...(approved ? { method: rail, operatorRef } : {})
+    });
+
+    if (!approved) t.create(db.collection("notifications").doc(), {
+      to: x.userId, from: req.user.uid, type: "transfer_rejected",
+      message: "Demande refusée : " + reason, read: false, createdAt: stamp()
+    });
+
+    const name = x.receiptFileName;
+    const privateFile = x.receiptStorage === "private-v1";
+    return !withdrawal && typeof name === "string" &&
+      (name.startsWith("receipts/" + x.userId + "/") || (!privateFile && name.startsWith(x.userId + "_")))
+      ? { name, privateFile } : null;
+  });
+
+  if (receipt) {
+    try {
+      const bucket = receipt.privateFile ? twReceipts() : supabase.storage.from("media");
+      const result = await bucket.remove([receipt.name]);
+      if (result.error) console.warn("MANUAL_RECEIPT_CLEANUP", transferId);
+    } catch { console.warn("MANUAL_RECEIPT_CLEANUP", transferId); }
+  }
+
+  return res.json({ success: true });
+}));
+
 
   app.post(
     "/api/merchant/admin/migrate-pin-hashes",
